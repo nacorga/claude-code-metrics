@@ -1,0 +1,40 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/nacorga/claude-code-metrics/schema/retro.schema.json",
+  "title": "Retrospective Row",
+  "description": "One row per /retrospective invocation. Joinable to auto.jsonl by session_id.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "session_id",
+    "ts",
+    "correction_rate",
+    "skill_trigger_accuracy",
+    "task_outcome"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "session_id": { "type": "string" },
+    "ts": { "type": "string", "format": "date-time" },
+    "correction_rate": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 10,
+      "description": "0 = never corrected Claude, 10 = corrected constantly"
+    },
+    "skill_trigger_accuracy": {
+      "type": "string",
+      "enum": ["good", "bad", "n-a"],
+      "description": "Did the right skills auto-fire at the right times?"
+    },
+    "task_outcome": {
+      "type": "string",
+      "enum": ["shipped", "blocked", "abandoned", "partial"]
+    },
+    "notes": {
+      "type": "string",
+      "description": "Optional free-text note"
+    }
+  },
+  "additionalProperties": false
+}

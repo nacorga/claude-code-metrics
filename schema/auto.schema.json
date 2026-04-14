@@ -1,0 +1,67 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/nacorga/claude-code-metrics/schema/auto.schema.json",
+  "title": "Auto Metrics Row",
+  "description": "One row per Claude Code SessionEnd (real close only, not compact/clear).",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "session_id",
+    "ts",
+    "duration_s",
+    "turn_count",
+    "tool_calls_total",
+    "tool_distribution",
+    "model",
+    "input_tokens",
+    "output_tokens",
+    "cache_creation_tokens",
+    "cache_read_tokens",
+    "cost_usd",
+    "cwd",
+    "permission_mode"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "session_id": { "type": "string" },
+    "ts": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO8601 timestamp when the row was written"
+    },
+    "duration_s": {
+      "type": ["number", "null"],
+      "minimum": 0,
+      "description": "Seconds between first and last transcript entry"
+    },
+    "turn_count": { "type": "integer", "minimum": 0 },
+    "tool_calls_total": { "type": "integer", "minimum": 0 },
+    "tool_distribution": {
+      "type": "object",
+      "description": "Map of tool name → invocation count",
+      "additionalProperties": { "type": "integer", "minimum": 0 }
+    },
+    "model": { "type": ["string", "null"] },
+    "input_tokens": { "type": "integer", "minimum": 0 },
+    "output_tokens": { "type": "integer", "minimum": 0 },
+    "cache_creation_tokens": { "type": "integer", "minimum": 0 },
+    "cache_read_tokens": { "type": "integer", "minimum": 0 },
+    "cost_usd": {
+      "type": ["number", "null"],
+      "minimum": 0,
+      "description": "Estimated cost. null if model is unknown and no _default fallback applied."
+    },
+    "cwd": { "type": "string" },
+    "permission_mode": { "type": ["string", "null"] },
+    "end_reason": {
+      "type": "string",
+      "enum": ["close"],
+      "description": "Always 'close' in v1. /compact and /clear are filtered out at the hook."
+    },
+    "error": {
+      "type": "string",
+      "description": "If present, indicates the hook could not fully parse the transcript. Other fields may be zero/null."
+    }
+  },
+  "additionalProperties": false
+}

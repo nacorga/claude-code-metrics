@@ -1,0 +1,53 @@
+name: Feature request
+description: Suggest a new metric, skill, or capability.
+title: "[feat] "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before opening, skim the README **Roadmap** section — we intentionally don't build dashboards or databases. Keep proposals in the JSONL-only spirit.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem are you trying to solve?
+      description: What can't you answer with your current metrics?
+      placeholder: |
+        I want to know whether plan mode actually reduces correction_rate in my workflow, but I can't tell without a diff view.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: What would the new metric / skill / flag look like?
+      placeholder: |
+        A /metrics-diff skill that compares two date ranges across all metrics.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: scope
+    attributes:
+      label: Which area does this touch?
+      multiple: true
+      options:
+        - New metric (auto.jsonl)
+        - New retro field (retro.jsonl)
+        - New skill
+        - Installer / uninstaller
+        - Schema / validation
+        - Docs only
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you considered
+      description: Why not solve this with a shell script, a jq one-liner, or an existing tool?
+    validations:
+      required: false

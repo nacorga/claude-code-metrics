@@ -1,0 +1,72 @@
+name: Bug report
+description: Something is broken or behaving unexpectedly.
+title: "[bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. A tight repro + one sanitized row from `~/.claude/metrics/auto.jsonl` usually tells us everything we need.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you expect vs. what did you see?
+      placeholder: |
+        I ran `/analyze-metrics` and got "insufficient retro data" even though retro.jsonl has 10 rows.
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: How do we reproduce it?
+      description: Exact steps, starting from a clean install if possible.
+      placeholder: |
+        1. bash scripts/install.sh
+        2. Run a Claude Code session, end it normally.
+        3. Invoke /retrospective, answer all three questions.
+        4. Invoke /analyze-metrics → error.
+    validations:
+      required: true
+
+  - type: textarea
+    id: sample-row
+    attributes:
+      label: Sample row from auto.jsonl or retro.jsonl
+      description: One line is enough. Strip `cwd` if the path reveals anything private.
+      render: json
+      placeholder: '{"schema_version":1,"session_id":"...","cost_usd":0.42, ...}'
+    validations:
+      required: false
+
+  - type: textarea
+    id: hook-log
+    attributes:
+      label: Relevant hook.log excerpt
+      description: Last 20 lines of `~/.claude/metrics/hook.log` if the issue touches the hook.
+      render: text
+    validations:
+      required: false
+
+  - type: input
+    id: python-version
+    attributes:
+      label: Python version
+      description: Output of `python3 --version`.
+      placeholder: Python 3.12.4
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - macOS
+        - Linux
+        - Windows (WSL)
+        - Other
+    validations:
+      required: true

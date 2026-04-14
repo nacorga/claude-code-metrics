@@ -1,0 +1,40 @@
+{
+  "_comment": "USD per 1M tokens. Estimates only — not billed cost. Verify at https://www.anthropic.com/pricing before trusting. Model IDs are matched by prefix (longest-first), fallback is _default.",
+  "_version": 1,
+  "claude-opus-4-5": {
+    "input": 15.0,
+    "output": 75.0,
+    "cache_write": 18.75,
+    "cache_read": 1.5
+  },
+  "claude-opus-4-6": {
+    "input": 15.0,
+    "output": 75.0,
+    "cache_write": 18.75,
+    "cache_read": 1.5
+  },
+  "claude-sonnet-4-5": {
+    "input": 3.0,
+    "output": 15.0,
+    "cache_write": 3.75,
+    "cache_read": 0.3
+  },
+  "claude-sonnet-4-6": {
+    "input": 3.0,
+    "output": 15.0,
+    "cache_write": 3.75,
+    "cache_read": 0.3
+  },
+  "claude-haiku-4-5": {
+    "input": 1.0,
+    "output": 5.0,
+    "cache_write": 1.25,
+    "cache_read": 0.1
+  },
+  "_default": {
+    "input": 3.0,
+    "output": 15.0,
+    "cache_write": 3.75,
+    "cache_read": 0.3
+  }
+}
