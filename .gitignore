@@ -25,3 +25,6 @@ Thumbs.db
 *.jsonl
 !examples/*.jsonl
 hook.log
+
+# Private working notes — strategy, dogfood logs, validation plan
+tasks/
