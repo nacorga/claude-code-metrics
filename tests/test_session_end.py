@@ -103,7 +103,6 @@ class TestSessionEndHook(unittest.TestCase):
             "session_id": "s-happy",
             "transcript_path": str(transcript),
             "cwd": "/tmp/demo",
-            "permission_mode": "default",
         }
         res = run_hook(payload, self.home)
         self.assertEqual(res.returncode, 0, res.stderr)
@@ -111,7 +110,7 @@ class TestSessionEndHook(unittest.TestCase):
         rows = read_jsonl(self.auto_path)
         self.assertEqual(len(rows), 1)
         row = rows[0]
-        self.assertEqual(row["schema_version"], 1)
+        self.assertEqual(row["schema_version"], 2)
         self.assertEqual(row["session_id"], "s-happy")
         self.assertEqual(row["model"], "claude-sonnet-4-5")
         self.assertEqual(row["turn_count"], 2)
@@ -167,7 +166,6 @@ class TestSessionEndHook(unittest.TestCase):
             "session_id": "s-miss",
             "transcript_path": "/does/not/exist",
             "cwd": "/x",
-            "permission_mode": "plan",
         }
         res = run_hook(payload, self.home)
         self.assertEqual(res.returncode, 0)
@@ -184,7 +182,6 @@ class TestSessionEndHook(unittest.TestCase):
             "session_id": "s-empty",
             "transcript_path": str(transcript),
             "cwd": "/x",
-            "permission_mode": "default",
         }
         res = run_hook(payload, self.home)
         self.assertEqual(res.returncode, 0)
@@ -204,7 +201,6 @@ class TestSessionEndHook(unittest.TestCase):
             "session_id": "s-corrupt",
             "transcript_path": str(transcript),
             "cwd": "/x",
-            "permission_mode": "default",
         }
         res = run_hook(payload, self.home)
         self.assertEqual(res.returncode, 0)
@@ -225,7 +221,6 @@ class TestSessionEndHook(unittest.TestCase):
             "session_id": "s-unknown",
             "transcript_path": str(transcript),
             "cwd": "/x",
-            "permission_mode": "default",
         }
         res = run_hook(payload, self.home)
         self.assertEqual(res.returncode, 0)
@@ -249,7 +244,6 @@ class TestSessionEndHook(unittest.TestCase):
             "session_id": "s-big",
             "transcript_path": str(transcript),
             "cwd": "/x",
-            "permission_mode": "default",
         }
         res = run_hook(payload, self.home)
         self.assertEqual(res.returncode, 0)
@@ -272,7 +266,6 @@ class TestSessionEndHook(unittest.TestCase):
             "session_id": "s-fork",
             "transcript_path": str(transcript),
             "cwd": "/x",
-            "permission_mode": "default",
         }
 
         start = time.monotonic()
@@ -316,7 +309,6 @@ class TestSessionEndHook(unittest.TestCase):
             "session_id": "s-big-fork",
             "transcript_path": str(transcript),
             "cwd": "/x",
-            "permission_mode": "default",
         }
 
         start = time.monotonic()
@@ -359,7 +351,6 @@ class TestSessionEndHook(unittest.TestCase):
             "session_id": "s-schema",
             "transcript_path": str(transcript),
             "cwd": "/x",
-            "permission_mode": "default",
         }, self.home)
         row = read_jsonl(self.auto_path)[0]
 
@@ -379,7 +370,6 @@ class TestSessionEndHook(unittest.TestCase):
             "session_id": "s-err-schema",
             "transcript_path": "/does/not/exist",
             "cwd": "/x",
-            "permission_mode": "default",
         }, self.home)
         row = read_jsonl(self.auto_path)[0]
 
@@ -401,11 +391,83 @@ class TestSessionEndHook(unittest.TestCase):
                 "session_id": sid,
                 "transcript_path": str(transcript),
                 "cwd": "/x",
-                "permission_mode": "default",
             }, self.home)
         rows = read_jsonl(self.auto_path)
         self.assertEqual(len(rows), 2)
         self.assertEqual({r["session_id"] for r in rows}, {"s-a", "s-b"})
+
+    # --- dedupe -------------------------------------------------------------
+
+    def test_duplicate_session_id_is_skipped(self):
+        """If a session_id already has a row, a second call must not append."""
+        transcript = self.home / "t.jsonl"
+        write_transcript(transcript, [
+            make_assistant("claude-sonnet-4-5", "2026-01-01T00:00:00Z",
+                           input_t=100, output_t=50, tools=["Read"]),
+        ])
+        payload = {
+            "hook_event_name": "SessionEnd",
+            "session_id": "s-dupe",
+            "transcript_path": str(transcript),
+            "cwd": "/first",
+        }
+        run_hook(payload, self.home)
+        payload["cwd"] = "/second"
+        run_hook(payload, self.home)
+
+        rows = read_jsonl(self.auto_path)
+        self.assertEqual(len(rows), 1, "dedupe failed: duplicate row appended")
+        self.assertEqual(rows[0]["cwd"], "/first", "first-write-wins violated")
+
+    def test_unknown_session_id_not_deduped(self):
+        """session_id='unknown' must never dedupe against itself — otherwise
+        every error row after the first would silently vanish."""
+        payload = {
+            "hook_event_name": "SessionEnd",
+            "transcript_path": "/does/not/exist",
+            "cwd": "/x",
+        }
+        run_hook(payload, self.home)
+        run_hook(payload, self.home)
+        rows = read_jsonl(self.auto_path)
+        self.assertEqual(len(rows), 2)
+        self.assertTrue(all(r["session_id"] == "unknown" for r in rows))
+
+    # --- duration cap -------------------------------------------------------
+
+    def test_implausible_duration_is_nulled(self):
+        """first_ts to last_ts > 24h must null duration_s (stale transcript)."""
+        transcript = self.home / "t.jsonl"
+        write_transcript(transcript, [
+            make_assistant("claude-sonnet-4-5", "2026-01-01T00:00:00Z", input_t=100),
+            make_assistant("claude-sonnet-4-5", "2026-01-03T00:00:00Z", input_t=100),
+        ])
+        run_hook({
+            "hook_event_name": "SessionEnd",
+            "session_id": "s-long",
+            "transcript_path": str(transcript),
+            "cwd": "/x",
+        }, self.home)
+        rows = read_jsonl(self.auto_path)
+        self.assertIsNone(rows[0]["duration_s"],
+                          "duration_s > 24h should be nulled")
+        self.assertEqual(rows[0]["turn_count"], 2)
+
+    def test_short_duration_preserved(self):
+        """Sanity: durations under the cap are untouched."""
+        transcript = self.home / "t.jsonl"
+        write_transcript(transcript, [
+            make_assistant("claude-sonnet-4-5", "2026-01-01T00:00:00Z", input_t=100),
+            make_assistant("claude-sonnet-4-5", "2026-01-01T00:10:00Z", input_t=100),
+        ])
+        run_hook({
+            "hook_event_name": "SessionEnd",
+            "session_id": "s-short",
+            "transcript_path": str(transcript),
+            "cwd": "/x",
+        }, self.home)
+        rows = read_jsonl(self.auto_path)
+        self.assertEqual(rows[0]["duration_s"], 600.0)
 
 
 if __name__ == "__main__":

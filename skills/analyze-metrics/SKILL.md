@@ -21,7 +21,12 @@ Summarise the local metrics JSONL files. Read-only — writes nothing to disk.
    from pathlib import Path
 
    m = Path.home() / ".claude" / "metrics"
-   auto = [json.loads(l) for l in (m / "auto.jsonl").read_text().splitlines() if l.strip()]
+   raw = [json.loads(l) for l in (m / "auto.jsonl").read_text().splitlines() if l.strip()]
+   # Error rows (no_transcript, parse_crash, etc.) are counted but excluded
+   # from aggregates — they'd skew averages with zero-cost zero-turn noise.
+   auto = [a for a in raw if not a.get("error")]
+   err_count = len(raw) - len(auto)
+
    retro_path = m / "retro.jsonl"
    retro = []
    if retro_path.is_file():
@@ -38,7 +43,9 @@ Summarise the local metrics JSONL files. Read-only — writes nothing to disk.
        return "\n".join(out)
 
    print("# claude-code-metrics report\n")
-   print(f"- sessions: **{len(auto)}**")
+   print(f"- sessions (real): **{len(auto)}**")
+   if err_count:
+       print(f"- error rows excluded: **{err_count}** (no transcript / parse crash)")
    costs = [a["cost_usd"] for a in auto if a.get("cost_usd") is not None]
    print(f"- total estimated cost: **${sum(costs):.4f}**")
    print(f"- sessions with retro: **{len(retro)} / {len(auto)}**")
@@ -70,15 +77,15 @@ Summarise the local metrics JSONL files. Read-only — writes nothing to disk.
        print("_insufficient retro data_")
    print()
 
-   # Correction rate by permission_mode (needs retro)
-   by_mode = defaultdict(list)
+   # Correction rate by model (needs retro)
+   by_model_corr = defaultdict(list)
    for j in joined:
-       if j.get("correction_rate") is not None and j.get("permission_mode"):
-           by_mode[j["permission_mode"]].append(j["correction_rate"])
-   print("## Avg correction_rate by permission_mode\n")
-   if by_mode:
-       rows = [(m, len(v), f"{statistics.mean(v):.2f}") for m, v in sorted(by_mode.items())]
-       print(table(["permission_mode", "sessions", "avg correction (0-10)"], rows))
+       if j.get("correction_rate") is not None and j.get("model"):
+           by_model_corr[j["model"]].append(j["correction_rate"])
+   print("## Avg correction_rate by model\n")
+   if by_model_corr:
+       rows = [(m, len(v), f"{statistics.mean(v):.2f}") for m, v in sorted(by_model_corr.items())]
+       print(table(["model", "sessions", "avg correction (0-10)"], rows))
    else:
        print("_insufficient retro data_")
    print()

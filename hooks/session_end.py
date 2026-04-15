@@ -27,7 +27,12 @@ import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+
+# Transcript timestamps sometimes span days when a session is resumed after
+# a long idle period. Anything above this cap is almost certainly wall-clock,
+# not work time — null it out rather than pollute aggregates.
+MAX_DURATION_S = 86400  # 24h
 
 METRICS_DIR = Path.home() / ".claude" / "metrics"
 AUTO_JSONL = METRICS_DIR / "auto.jsonl"
@@ -146,6 +151,9 @@ def parse_transcript(path: Path) -> dict:
     duration_s = None
     if first_ts and last_ts:
         duration_s = round((last_ts - first_ts).total_seconds(), 2)
+        if duration_s > MAX_DURATION_S:
+            log(f"implausible duration_s={duration_s} (>{MAX_DURATION_S}s), nulling")
+            duration_s = None
 
     return {
         "model": model,
@@ -174,11 +182,37 @@ def estimate_cost(parsed: dict, pricing: dict) -> tuple[float | None, str | None
     return cost, matched
 
 
+def _session_already_recorded(session_id: str) -> bool:
+    """Scan auto.jsonl for an existing row with the given session_id.
+    Called while holding the lock in append_row."""
+    if not AUTO_JSONL.is_file():
+        return False
+    try:
+        with AUTO_JSONL.open("r") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if row.get("session_id") == session_id:
+                    return True
+    except Exception as e:
+        log(f"dedupe scan failed: {e}")
+    return False
+
+
 def append_row(row: dict) -> None:
     METRICS_DIR.mkdir(parents=True, exist_ok=True)
     with LOCK_PATH.open("a") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         try:
+            sid = row.get("session_id")
+            if sid and sid != "unknown" and _session_already_recorded(sid):
+                log(f"dedupe: session_id {sid} already recorded, skipping")
+                return
             with AUTO_JSONL.open("a") as f:
                 f.write(json.dumps(row, separators=(",", ":")) + "\n")
         finally:
@@ -199,14 +233,12 @@ def run_worker(payload: dict) -> None:
     session_id = payload.get("session_id") or "unknown"
     transcript_path = payload.get("transcript_path")
     cwd = payload.get("cwd") or ""
-    permission_mode = payload.get("permission_mode")
 
     row: dict = {
         "schema_version": SCHEMA_VERSION,
         "session_id": session_id,
         "ts": datetime.now(timezone.utc).isoformat(),
         "cwd": cwd,
-        "permission_mode": permission_mode,
         "end_reason": "close",
     }
 

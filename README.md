@@ -51,7 +51,7 @@ And whenever you want to see your data:
 
 Every real session close appends one row with:
 
-- `session_id`, `ts`, `cwd`, `permission_mode`, `end_reason`
+- `session_id`, `ts`, `cwd`, `end_reason`
 - `duration_s`, `turn_count`, `tool_calls_total`, `tool_distribution`
 - `model`, `input_tokens`, `output_tokens`, `cache_creation_tokens`, `cache_read_tokens`
 - `cost_usd` (estimated from `config/pricing.json`)
