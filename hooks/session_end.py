@@ -148,6 +148,12 @@ def parse_transcript(path: Path) -> dict:
                     name = block.get("name") or "<unknown>"
                     tool_counts[name] = tool_counts.get(name, 0) + 1
 
+    # Transcript existed but no assistant ever responded (session abandoned,
+    # /clear before first turn, hook fired mid-flush). Mark as error so
+    # /analyze-metrics excludes it from aggregates.
+    if turn_count == 0:
+        return {"error": "empty_transcript"}
+
     duration_s = None
     if first_ts and last_ts:
         duration_s = round((last_ts - first_ts).total_seconds(), 2)

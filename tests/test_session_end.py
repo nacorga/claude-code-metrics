@@ -469,6 +469,26 @@ class TestSessionEndHook(unittest.TestCase):
         rows = read_jsonl(self.auto_path)
         self.assertEqual(rows[0]["duration_s"], 600.0)
 
+    def test_empty_transcript_is_marked_error(self):
+        """Transcript with timestamps but zero assistant turns must be
+        error='empty_transcript' so /analyze-metrics excludes it."""
+        transcript = self.home / "t.jsonl"
+        write_transcript(transcript, [
+            {"type": "user", "timestamp": "2026-01-01T00:00:00Z",
+             "message": {"content": "hi"}},
+        ])
+        run_hook({
+            "hook_event_name": "SessionEnd",
+            "session_id": "s-empty",
+            "transcript_path": str(transcript),
+            "cwd": "/x",
+        }, self.home)
+        rows = read_jsonl(self.auto_path)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["error"], "empty_transcript")
+        self.assertEqual(rows[0]["turn_count"], 0)
+        self.assertIsNone(rows[0]["cost_usd"])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
