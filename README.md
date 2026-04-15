@@ -69,6 +69,10 @@ bash scripts/uninstall.sh --purge-data # also wipes ~/.claude/metrics/
 
 Idempotent. Preserves any other hooks you have registered in `settings.json`.
 
+## Your terminal never hangs on session close
+
+When you exit Claude Code, the hook returns instantly and finishes its work in the background — even if the session's transcript is 60MB+. You won't see the terminal freeze.
+
 ## Privacy
 
 Everything is local under `~/.claude/metrics/`. Zero network calls. Nothing is sent to me, Anthropic, or anyone else. Your transcripts are parsed on your machine, aggregated, then thrown away — only the aggregates are written to the JSONL.

@@ -8,9 +8,13 @@ pricing table, and appends a single JSON line to ~/.claude/metrics/auto.jsonl.
 
 Design invariants:
   - Always exits 0. Never blocks Claude Code.
+  - Returns to the shell in <100ms: heavy work is detached via double-fork
+    so large transcripts (tens of MB) cannot stall session close.
   - Stderr is captured to ~/.claude/metrics/hook.log for debugging.
   - Skips /compact and /clear ends (we only record real session closes).
   - Uses fcntl.flock to serialise concurrent writers.
+
+Set CCM_NO_FORK=1 to run synchronously (used by tests).
 """
 
 from __future__ import annotations
@@ -190,20 +194,8 @@ def should_skip(payload: dict) -> bool:
     return False
 
 
-def main() -> int:
-    try:
-        raw = sys.stdin.read()
-        payload = json.loads(raw) if raw.strip() else {}
-    except Exception as e:
-        log(f"invalid stdin: {e}")
-        return 0
-
-    if payload.get("hook_event_name") and payload["hook_event_name"] != "SessionEnd":
-        return 0
-
-    if should_skip(payload):
-        return 0
-
+def run_worker(payload: dict) -> None:
+    """Full parse + cost + append. May take seconds on large transcripts."""
     session_id = payload.get("session_id") or "unknown"
     transcript_path = payload.get("transcript_path")
     cwd = payload.get("cwd") or ""
@@ -222,7 +214,7 @@ def main() -> int:
         row["error"] = "no_transcript_path"
         row.update(_empty_metrics())
         append_row(row)
-        return 0
+        return
 
     try:
         parsed = parse_transcript(Path(transcript_path))
@@ -234,7 +226,7 @@ def main() -> int:
         row["error"] = parsed["error"]
         row.update(_empty_metrics())
         append_row(row)
-        return 0
+        return
 
     pricing = load_pricing()
     cost, matched = estimate_cost(parsed, pricing)
@@ -259,6 +251,80 @@ def main() -> int:
         log(f"using _default pricing for {model} — add explicit entry to pricing.json for accuracy")
 
     append_row(row)
+
+
+def _detach_and_run(payload: dict) -> None:
+    """Double-fork so the worker survives parent exit and does not tie the
+    shell to transcript-parse duration. Grandchild closes stdio and runs
+    run_worker; errors go to hook.log."""
+    try:
+        pid = os.fork()
+    except OSError as e:
+        log(f"fork failed, running synchronously: {e}")
+        run_worker(payload)
+        return
+
+    if pid > 0:
+        # Parent: reap the intermediate child so it does not become a zombie,
+        # then return to main() which exits 0. The grandchild is reparented
+        # to init and keeps running.
+        try:
+            os.waitpid(pid, 0)
+        except OSError:
+            pass
+        return
+
+    # First child: detach from the controlling terminal and fork again.
+    try:
+        os.setsid()
+    except OSError:
+        pass
+    try:
+        pid2 = os.fork()
+    except OSError:
+        os._exit(0)
+    if pid2 > 0:
+        os._exit(0)
+
+    # Grandchild: become a daemon. Close std fds so Claude Code does not
+    # wait on our pipes.
+    try:
+        devnull = os.open(os.devnull, os.O_RDWR)
+        os.dup2(devnull, 0)
+        os.dup2(devnull, 1)
+        os.dup2(devnull, 2)
+        if devnull > 2:
+            os.close(devnull)
+    except Exception:
+        pass
+
+    try:
+        run_worker(payload)
+    except Exception as e:
+        log(f"async worker crashed: {e}\n{traceback.format_exc()}")
+    finally:
+        os._exit(0)
+
+
+def main() -> int:
+    try:
+        raw = sys.stdin.read()
+        payload = json.loads(raw) if raw.strip() else {}
+    except Exception as e:
+        log(f"invalid stdin: {e}")
+        return 0
+
+    if payload.get("hook_event_name") and payload["hook_event_name"] != "SessionEnd":
+        return 0
+
+    if should_skip(payload):
+        return 0
+
+    if os.environ.get("CCM_NO_FORK"):
+        run_worker(payload)
+        return 0
+
+    _detach_and_run(payload)
     return 0
 
 

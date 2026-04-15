@@ -13,16 +13,26 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 HOOK = REPO / "hooks" / "session_end.py"
+AUTO_SCHEMA = REPO / "schema" / "auto.schema.json"
 
 
-def run_hook(payload: dict, home: Path) -> subprocess.CompletedProcess:
-    """Run the hook with a synthetic stdin payload and an isolated HOME."""
+def run_hook(payload: dict, home: Path, fork: bool = False) -> subprocess.CompletedProcess:
+    """Run the hook with a synthetic stdin payload and an isolated HOME.
+
+    By default tests run synchronously (CCM_NO_FORK=1) so the process exits
+    after writing the row. Pass fork=True to exercise the detach path.
+    """
     env = {**os.environ, "HOME": str(home)}
+    if not fork:
+        env["CCM_NO_FORK"] = "1"
+    else:
+        env.pop("CCM_NO_FORK", None)
     return subprocess.run(
         [sys.executable, str(HOOK)],
         input=json.dumps(payload),
@@ -246,6 +256,137 @@ class TestSessionEndHook(unittest.TestCase):
         rows = read_jsonl(self.auto_path)
         expected = 2 * 3.0 + 0.5 * 15.0 + 0.1 * 3.75 + 10 * 0.30  # 16.875
         self.assertAlmostEqual(rows[0]["cost_usd"], expected, places=4)
+
+    # --- detach path --------------------------------------------------------
+
+    def test_fork_parent_returns_fast_and_grandchild_writes(self):
+        """Without CCM_NO_FORK the parent double-forks and returns fast;
+        the detached grandchild still writes the row."""
+        transcript = self.home / "t.jsonl"
+        write_transcript(transcript, [
+            make_assistant("claude-sonnet-4-5", "2026-01-01T00:00:00Z",
+                           input_t=100, output_t=50, tools=["Read"]),
+        ])
+        payload = {
+            "hook_event_name": "SessionEnd",
+            "session_id": "s-fork",
+            "transcript_path": str(transcript),
+            "cwd": "/x",
+            "permission_mode": "default",
+        }
+
+        start = time.monotonic()
+        res = run_hook(payload, self.home, fork=True)
+        elapsed = time.monotonic() - start
+
+        self.assertEqual(res.returncode, 0, res.stderr)
+        # Parent must return in well under 1s even with a transcript to parse.
+        self.assertLess(elapsed, 1.0,
+                        f"parent blocked {elapsed:.2f}s — detach is broken")
+
+        # Wait up to 3s for the grandchild to finish writing.
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            if self.auto_path.is_file() and self.auto_path.stat().st_size > 0:
+                break
+            time.sleep(0.05)
+
+        rows = read_jsonl(self.auto_path)
+        self.assertEqual(len(rows), 1, "grandchild did not write row")
+        self.assertEqual(rows[0]["session_id"], "s-fork")
+        self.assertEqual(rows[0]["input_tokens"], 100)
+
+    def test_fork_returns_fast_with_large_transcript(self):
+        """Regression guard: detach must absorb long parse work. A 2000-entry
+        transcript takes ~seconds to parse synchronously, but the parent
+        process must still return in well under 0.5s."""
+        transcript = self.home / "big.jsonl"
+        entries = [
+            make_assistant("claude-sonnet-4-5",
+                           f"2026-01-01T00:00:{i % 60:02d}Z",
+                           input_t=100, output_t=50, tools=["Grep"])
+            for i in range(2000)
+        ]
+        write_transcript(transcript, entries)
+        # Sanity: transcript should be meaningful in size (>300KB)
+        self.assertGreater(transcript.stat().st_size, 300_000)
+
+        payload = {
+            "hook_event_name": "SessionEnd",
+            "session_id": "s-big-fork",
+            "transcript_path": str(transcript),
+            "cwd": "/x",
+            "permission_mode": "default",
+        }
+
+        start = time.monotonic()
+        res = run_hook(payload, self.home, fork=True)
+        elapsed = time.monotonic() - start
+
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertLess(elapsed, 0.5,
+                        f"parent blocked {elapsed:.2f}s on 2000-entry transcript "
+                        f"— detach did not decouple parse time")
+
+        # Grandchild may take longer; wait up to 10s.
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            if self.auto_path.is_file() and self.auto_path.stat().st_size > 0:
+                break
+            time.sleep(0.1)
+
+        rows = read_jsonl(self.auto_path)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["turn_count"], 2000)
+        self.assertEqual(rows[0]["input_tokens"], 200_000)
+
+    # --- schema drift guard -------------------------------------------------
+
+    def test_happy_row_has_all_schema_required_fields(self):
+        """Whatever the hook writes must satisfy schema/auto.schema.json's
+        required[]. Catches silent drift when we add/remove row fields."""
+        schema = json.loads(AUTO_SCHEMA.read_text())
+        required = set(schema.get("required", []))
+        allowed = set(schema.get("properties", {}).keys())
+
+        transcript = self.home / "t.jsonl"
+        write_transcript(transcript, [
+            make_assistant("claude-sonnet-4-5", "2026-01-01T00:00:00Z",
+                           input_t=100, output_t=50, tools=["Read"]),
+        ])
+        run_hook({
+            "hook_event_name": "SessionEnd",
+            "session_id": "s-schema",
+            "transcript_path": str(transcript),
+            "cwd": "/x",
+            "permission_mode": "default",
+        }, self.home)
+        row = read_jsonl(self.auto_path)[0]
+
+        missing = required - set(row.keys())
+        unknown = set(row.keys()) - allowed
+        self.assertFalse(missing, f"row missing required fields: {missing}")
+        self.assertFalse(unknown, f"row has fields not in schema: {unknown}")
+
+    def test_error_row_has_all_schema_required_fields(self):
+        """Error path must also satisfy the schema."""
+        schema = json.loads(AUTO_SCHEMA.read_text())
+        required = set(schema.get("required", []))
+        allowed = set(schema.get("properties", {}).keys())
+
+        run_hook({
+            "hook_event_name": "SessionEnd",
+            "session_id": "s-err-schema",
+            "transcript_path": "/does/not/exist",
+            "cwd": "/x",
+            "permission_mode": "default",
+        }, self.home)
+        row = read_jsonl(self.auto_path)[0]
+
+        missing = required - set(row.keys())
+        unknown = set(row.keys()) - allowed
+        self.assertFalse(missing, f"error row missing required fields: {missing}")
+        self.assertFalse(unknown, f"error row has fields not in schema: {unknown}")
 
     # --- concurrency proxy --------------------------------------------------
 

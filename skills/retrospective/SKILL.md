@@ -22,7 +22,7 @@ Log how the session actually went. Joins to `auto.jsonl` by `session_id`.
 
    ```bash
    python3 - <<'PY'
-   import fcntl, json, os
+   import fcntl, json
    from datetime import datetime, timezone
    from pathlib import Path
 

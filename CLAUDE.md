@@ -8,6 +8,7 @@ Guidance for Claude Code (and contributors) working in this repo. See [README.md
 - **Zero runtime deps.** Hook uses stdlib Python 3.9+. Installer uses bash + python3. If a feature needs a dep, reconsider the feature.
 - **Always local.** The hook must never make a network call. No telemetry, no remote reporting, no "opt-in analytics".
 - **Never block Claude Code.** The hook must always `exit 0`, even on crashes. Any failure logs to `~/.claude/metrics/hook.log` and moves on.
+- **Return to the shell in <100ms.** Heavy work (transcript parsing) runs in a double-forked, detached grandchild. Large sessions (60MB+ transcripts) cannot stall session close. Set `CCM_NO_FORK=1` for synchronous execution (tests).
 - **Append-only.** We never rewrite `auto.jsonl` / `retro.jsonl`. Migrations happen by bumping `schema_version` and letting old + new rows coexist.
 
 ## Critical files
