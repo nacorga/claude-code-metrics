@@ -160,7 +160,9 @@ class TestSessionEndHook(unittest.TestCase):
 
     # --- defensive paths ----------------------------------------------------
 
-    def test_missing_transcript_writes_error_row(self):
+    def test_missing_transcript_writes_no_row(self):
+        """Ghost session: payload points at a file that was never written.
+        Treated as silent skip (like /compact / /clear) — no row appended."""
         payload = {
             "hook_event_name": "SessionEnd",
             "session_id": "s-miss",
@@ -169,24 +171,34 @@ class TestSessionEndHook(unittest.TestCase):
         }
         res = run_hook(payload, self.home)
         self.assertEqual(res.returncode, 0)
-        rows = read_jsonl(self.auto_path)
-        self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0]["error"], "no_transcript")
-        self.assertIsNone(rows[0]["cost_usd"])
+        self.assertFalse(self.auto_path.exists(),
+                         "ghost session must not produce a row")
 
-    def test_empty_transcript_writes_error_row(self):
+    def test_zero_byte_transcript_writes_no_row(self):
+        """Transcript file exists but is 0 bytes (flush race or abandoned
+        session). Treated as ghost — silent skip."""
         transcript = self.home / "empty.jsonl"
         transcript.write_text("")
         payload = {
             "hook_event_name": "SessionEnd",
-            "session_id": "s-empty",
+            "session_id": "s-zerobyte",
             "transcript_path": str(transcript),
             "cwd": "/x",
         }
         res = run_hook(payload, self.home)
         self.assertEqual(res.returncode, 0)
-        rows = read_jsonl(self.auto_path)
-        self.assertEqual(rows[0]["error"], "no_transcript")
+        self.assertFalse(self.auto_path.exists())
+
+    def test_missing_transcript_path_writes_no_row(self):
+        """Payload with no transcript_path key at all — also a ghost."""
+        payload = {
+            "hook_event_name": "SessionEnd",
+            "session_id": "s-nopath",
+            "cwd": "/x",
+        }
+        res = run_hook(payload, self.home)
+        self.assertEqual(res.returncode, 0)
+        self.assertFalse(self.auto_path.exists())
 
     def test_corrupt_lines_are_skipped(self):
         transcript = self.home / "t.jsonl"
@@ -360,15 +372,22 @@ class TestSessionEndHook(unittest.TestCase):
         self.assertFalse(unknown, f"row has fields not in schema: {unknown}")
 
     def test_error_row_has_all_schema_required_fields(self):
-        """Error path must also satisfy the schema."""
+        """Error path must also satisfy the schema. Triggered via
+        empty_transcript (file exists but no assistant turns), since ghost
+        sessions (missing/zero-byte file) no longer produce rows."""
         schema = json.loads(AUTO_SCHEMA.read_text())
         required = set(schema.get("required", []))
         allowed = set(schema.get("properties", {}).keys())
 
+        transcript = self.home / "t.jsonl"
+        write_transcript(transcript, [
+            {"type": "user", "timestamp": "2026-01-01T00:00:00Z",
+             "message": {"content": "hi"}},
+        ])
         run_hook({
             "hook_event_name": "SessionEnd",
             "session_id": "s-err-schema",
-            "transcript_path": "/does/not/exist",
+            "transcript_path": str(transcript),
             "cwd": "/x",
         }, self.home)
         row = read_jsonl(self.auto_path)[0]
@@ -421,10 +440,17 @@ class TestSessionEndHook(unittest.TestCase):
 
     def test_unknown_session_id_not_deduped(self):
         """session_id='unknown' must never dedupe against itself — otherwise
-        every error row after the first would silently vanish."""
+        every error row after the first would silently vanish. Triggered via
+        empty_transcript so rows actually get written (ghost sessions now
+        silently skip)."""
+        transcript = self.home / "t.jsonl"
+        write_transcript(transcript, [
+            {"type": "user", "timestamp": "2026-01-01T00:00:00Z",
+             "message": {"content": "hi"}},
+        ])
         payload = {
             "hook_event_name": "SessionEnd",
-            "transcript_path": "/does/not/exist",
+            "transcript_path": str(transcript),
             "cwd": "/x",
         }
         run_hook(payload, self.home)
@@ -432,6 +458,7 @@ class TestSessionEndHook(unittest.TestCase):
         rows = read_jsonl(self.auto_path)
         self.assertEqual(len(rows), 2)
         self.assertTrue(all(r["session_id"] == "unknown" for r in rows))
+        self.assertTrue(all(r["error"] == "empty_transcript" for r in rows))
 
     # --- duration cap -------------------------------------------------------
 

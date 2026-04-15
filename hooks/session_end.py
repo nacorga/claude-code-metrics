@@ -96,7 +96,10 @@ def parse_iso(ts: str | None):
 
 
 def parse_transcript(path: Path) -> dict:
-    """Extract aggregates from the Claude Code transcript JSONL."""
+    """Extract aggregates from the Claude Code transcript JSONL.
+
+    Caller (run_worker) guarantees the file exists and is non-empty.
+    """
     model: str | None = None
     first_ts = None
     last_ts = None
@@ -106,9 +109,6 @@ def parse_transcript(path: Path) -> dict:
     cache_creation = 0
     cache_read = 0
     tool_counts: dict[str, int] = {}
-
-    if not path.is_file() or path.stat().st_size == 0:
-        return {"error": "no_transcript"}
 
     with path.open("r") as f:
         for line in f:
@@ -240,6 +240,18 @@ def run_worker(payload: dict) -> None:
     transcript_path = payload.get("transcript_path")
     cwd = payload.get("cwd") or ""
 
+    # Ghost session guard: Claude Code fires SessionEnd even for sessions
+    # that never produced a transcript (opened-and-closed, cancelled prompt,
+    # etc.). No transcript on disk means no data worth recording — treat it
+    # the same as /compact and /clear: silent skip, no row.
+    if not transcript_path:
+        log(f"skip: no transcript_path in payload (session_id={session_id})")
+        return
+    tp = Path(transcript_path)
+    if not tp.is_file() or tp.stat().st_size == 0:
+        log(f"skip: ghost session, transcript missing or empty at {transcript_path} (session_id={session_id})")
+        return
+
     row: dict = {
         "schema_version": SCHEMA_VERSION,
         "session_id": session_id,
@@ -248,14 +260,8 @@ def run_worker(payload: dict) -> None:
         "end_reason": "close",
     }
 
-    if not transcript_path:
-        row["error"] = "no_transcript_path"
-        row.update(_empty_metrics())
-        append_row(row)
-        return
-
     try:
-        parsed = parse_transcript(Path(transcript_path))
+        parsed = parse_transcript(tp)
     except Exception as e:
         log(f"transcript parse crashed: {e}\n{traceback.format_exc()}")
         parsed = {"error": "parse_crash"}
