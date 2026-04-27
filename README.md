@@ -101,6 +101,8 @@ Don't sync `~/.claude/metrics/` to iCloud/Dropbox — `flock` is unreliable on n
 
 `cost_usd` is **estimated from token counts**, not billed cost. It will drift 10-20% from your actual Anthropic invoice (cache accounting edge cases, tool result tokens, etc.). Use it for **relative** comparisons between sessions, not as your accounting source of truth.
 
+**If you're on a flat-rate subscription (Claude Max, etc.), `cost_usd` is the API-equivalent of your usage — what your sessions would have cost on pay-per-token. It is not what you actually pay.** Treat it as a usage-intensity signal, not a bill. The ratio `cost_usd / (subscription prorated to the same time window)` is a useful "how hard am I leaning on this plan" indicator.
+
 When Anthropic ships new model IDs, update [`config/pricing.json`](./config/pricing.json). The script uses prefix matching (longest-first) with a `_default` fallback, so unknown models still get a rough estimate.
 
 ## Roadmap

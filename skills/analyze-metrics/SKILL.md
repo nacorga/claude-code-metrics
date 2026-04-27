@@ -149,6 +149,62 @@ Summarise the local metrics JSONL files. Read-only — writes nothing to disk.
    print(table(["model", "hit rate", "cache_read", "cache_create"], rows) if rows else "_no data_")
    print()
 
+   # Cache savings — how much cheaper each model got via cache_read vs full input rate.
+   # Counterfactual: if cache_read tokens had been billed as input, the bill would be higher
+   # by (input_rate - cache_read_rate) per cache_read token. Sums to a per-model and total figure.
+   print("## Cache savings (counterfactual: no cache)\n")
+   pricing_path = m / "pricing.json"
+   pricing = {}
+   if pricing_path.is_file():
+       try:
+           pricing = json.loads(pricing_path.read_text())
+       except Exception:
+           pricing = {}
+
+   def _rates_for(model_id):
+       if not model_id or not pricing:
+           return None
+       keys = [k for k in pricing if not k.startswith("_") and model_id.startswith(k)]
+       keys.sort(key=len, reverse=True)
+       entry = pricing.get(keys[0]) if keys else pricing.get("_default")
+       if not entry:
+           return None
+       return entry.get("input"), entry.get("cache_read")
+
+   savings_by_model = defaultdict(lambda: [0.0, 0])  # [usd_saved, cache_read_tokens]
+   total_actual = 0.0
+   total_counterfactual = 0.0
+   for a in auto:
+       model_id = a.get("model") or ""
+       cr = a.get("cache_read_tokens") or 0
+       if cr <= 0:
+           continue
+       rates = _rates_for(model_id)
+       if not rates or rates[0] is None or rates[1] is None:
+           continue
+       rate_in, rate_cr = rates
+       saved = cr * (rate_in - rate_cr) / 1_000_000
+       savings_by_model[model_id or "unknown"][0] += saved
+       savings_by_model[model_id or "unknown"][1] += cr
+       if a.get("cost_usd") is not None:
+           total_actual += a["cost_usd"]
+           total_counterfactual += a["cost_usd"] + saved
+
+   if savings_by_model:
+       rows = sorted(
+           ((m_, f"{cr:,}", f"${s:.2f}") for m_, (s, cr) in savings_by_model.items()),
+           key=lambda r: float(r[2].lstrip("$")), reverse=True,
+       )
+       print(table(["model", "cache_read tokens", "saved vs no-cache"], rows))
+       total_saved = sum(s for s, _ in savings_by_model.values())
+       print(f"\n_total saved by cache: **${total_saved:.2f}**_")
+       if total_actual > 0:
+           ratio = total_counterfactual / total_actual
+           print(f"_actual estimated cost ${total_actual:.2f} vs no-cache counterfactual ${total_counterfactual:.2f} ({ratio:.1f}× cheaper with cache)_")
+   else:
+       print("_no cache_read tokens captured, or pricing.json unavailable_")
+   print()
+
    # Marathon sessions — turn_count > 300 indicates autonomous runs that drift expensive
    print("## Marathon sessions (turn_count > 300)\n")
    marathons = sorted(
