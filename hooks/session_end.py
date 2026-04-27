@@ -22,12 +22,22 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import re
+import subprocess
 import sys
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 5
+
+# A subagent dispatch whose tool_result text is under this many characters is
+# flagged as "cheap": likely a question that could have been answered with a
+# direct grep/Read. The subagent overhead (extra context window, latency,
+# tokens) is wasted on questions with tiny answers. 200 picked from
+# observation: real Explore reports run thousands of chars; a 50-char "yes,
+# the file exists at X" is exactly the failure mode worth surfacing.
+CHEAP_RETURN_THRESHOLD = 200
 
 # Conversation-shape heuristics (v3).
 # Short follow-up threshold: any user text message under this many chars
@@ -87,6 +97,85 @@ def log(msg: str) -> None:
             f.write(f"[{datetime.now(timezone.utc).isoformat()}] {msg}\n")
     except Exception:
         pass
+
+
+# v5. Project-identity helpers. Captured per-session in run_worker so reports
+# can group by stable repo identity instead of cwd basename. Pure best-effort:
+# any failure (no git, no repo, no remote, broken URL) yields empty strings —
+# the row stays valid and legacy behaviour (cwd-based grouping) takes over.
+_SSH_ORIGIN = re.compile(r"^[A-Za-z0-9_-]+@([^:]+):(.+)$")
+_URL_ORIGIN = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*://(?:[^@/]+@)?([^/]+)/(.+)$")
+
+
+def _normalize_origin(url: str) -> str:
+    """Normalize a git remote.origin.url into a stable 'host/owner/repo' key.
+
+    Handles SSH (`git@github.com:foo/bar.git`), HTTPS with optional auth
+    (`https://user@github.com/foo/bar.git`), and ssh:// / git:// schemes.
+    Strips the trailing `.git`. Falls back to the raw input (minus `.git`) for
+    shapes we don't recognize (file://, custom hosts) — never invents a value.
+    """
+    if not url:
+        return ""
+    s = url.strip()
+    if not s:
+        return ""
+    if s.endswith(".git"):
+        s = s[:-4]
+    m = _SSH_ORIGIN.match(s)
+    if m:
+        return f"{m.group(1)}/{m.group(2)}"
+    m = _URL_ORIGIN.match(s)
+    if m:
+        return f"{m.group(1)}/{m.group(2)}"
+    return s
+
+
+def _capture_git_metadata(cwd: str) -> tuple[str, str]:
+    """Return (git_root, raw_origin_url) for cwd. Both empty when cwd is not
+    inside a git repo, no origin is configured, or git is unavailable.
+
+    Runs only inside the detached worker (post double-fork), so the 2s
+    timeout cannot stall Claude Code's session close. Expected failures —
+    git binary missing (FileNotFoundError), cwd outside a repo, missing
+    remote — are silent. Only timeouts and genuine OS errors log, since
+    those signal something worth investigating.
+    """
+    if not cwd:
+        return "", ""
+    try:
+        if not Path(cwd).is_dir():
+            return "", ""
+    except OSError:
+        return "", ""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", cwd, "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, timeout=2,
+        )
+    except FileNotFoundError:
+        return "", ""
+    except (subprocess.TimeoutExpired, OSError) as e:
+        log(f"git rev-parse failed at {cwd}: {e}")
+        return "", ""
+    if proc.returncode != 0:
+        return "", ""
+    git_root = proc.stdout.strip()
+    if not git_root:
+        return "", ""
+    try:
+        proc2 = subprocess.run(
+            ["git", "-C", git_root, "config", "--get", "remote.origin.url"],
+            capture_output=True, text=True, timeout=2,
+        )
+    except FileNotFoundError:
+        return git_root, ""
+    except (subprocess.TimeoutExpired, OSError) as e:
+        log(f"git config failed at {git_root}: {e}")
+        return git_root, ""
+    if proc2.returncode != 0:
+        return git_root, ""
+    return git_root, proc2.stdout.strip()
 
 
 def load_pricing() -> dict:
@@ -149,15 +238,32 @@ def _user_text(content) -> str | None:
     return None
 
 
-def _count_tool_errors(content) -> int:
-    """Count tool_result blocks marked is_error=true inside a user-entry's content."""
-    if not isinstance(content, list):
-        return 0
-    n = 0
-    for c in content:
-        if isinstance(c, dict) and c.get("type") == "tool_result" and c.get("is_error"):
-            n += 1
-    return n
+def _tool_result_text_len(content) -> int:
+    """Char-count of a tool_result's payload — the size of what the subagent
+    injects back into the main agent's context. Handles both shapes the
+    transcript uses: a plain string, or a list of {type:text,text:…} blocks."""
+    if isinstance(content, str):
+        return len(content)
+    if isinstance(content, list):
+        n = 0
+        for c in content:
+            if isinstance(c, dict) and c.get("type") == "text":
+                t = c.get("text")
+                if isinstance(t, str):
+                    n += len(t)
+        return n
+    return 0
+
+
+def _empty_subagent_stat() -> dict:
+    return {
+        "count": 0,
+        "return_chars_total": 0,
+        "duration_s_total": 0.0,
+        "errors": 0,
+        "max_return_chars": 0,
+        "max_duration_s": 0.0,
+    }
 
 
 def parse_transcript(path: Path) -> dict:
@@ -179,6 +285,14 @@ def parse_transcript(path: Path) -> dict:
     user_msg_count = 0
     short_user_followups_count = 0
     correction_keyword_hits = 0
+    # v4: per-subagent return-surface aggregates. We cannot attribute tokens
+    # to a subagent (the transcript only records main-agent usage), but we can
+    # measure what the subagent dumps back into the main context: chars,
+    # duration, errors. pending_dispatches holds Agent tool_use blocks waiting
+    # for their matching tool_result by tool_use_id.
+    pending_dispatches: dict[str, tuple[str, "datetime | None"]] = {}
+    subagent_stats: dict[str, dict] = {}
+    cheap_subagent_calls = 0
 
     with path.open("r") as f:
         for line in f:
@@ -202,8 +316,40 @@ def parse_transcript(path: Path) -> dict:
             if etype == "user":
                 msg = entry.get("message") or {}
                 content = msg.get("content")
-                # Count tool errors from synthetic user entries (tool_result blocks)
-                tool_errors_count += _count_tool_errors(content)
+                # Walk tool_result blocks once: count errors AND resolve any
+                # pending Agent dispatches whose results have arrived.
+                if isinstance(content, list):
+                    for c in content:
+                        if not (isinstance(c, dict) and c.get("type") == "tool_result"):
+                            continue
+                        is_err = c.get("is_error") is True
+                        if is_err:
+                            tool_errors_count += 1
+                        tu_id = c.get("tool_use_id")
+                        if tu_id and tu_id in pending_dispatches:
+                            sub, dispatch_ts = pending_dispatches.pop(tu_id)
+                            ret_chars = _tool_result_text_len(c.get("content"))
+                            dur = None
+                            if dispatch_ts and ts:
+                                delta = round((ts - dispatch_ts).total_seconds(), 2)
+                                # Negative deltas can appear in resumed/edited
+                                # transcripts where timestamps are non-monotonic.
+                                # Drop them rather than poison aggregates.
+                                if delta >= 0:
+                                    dur = delta
+                            stat = subagent_stats.setdefault(sub, _empty_subagent_stat())
+                            stat["count"] += 1
+                            stat["return_chars_total"] += ret_chars
+                            if ret_chars > stat["max_return_chars"]:
+                                stat["max_return_chars"] = ret_chars
+                            if dur is not None:
+                                stat["duration_s_total"] = round(stat["duration_s_total"] + dur, 2)
+                                if dur > stat["max_duration_s"]:
+                                    stat["max_duration_s"] = dur
+                            if is_err:
+                                stat["errors"] += 1
+                            if ret_chars < CHEAP_RETURN_THRESHOLD:
+                                cheap_subagent_calls += 1
                 # Real user messages
                 text = _user_text(content)
                 if text is not None:
@@ -246,6 +392,9 @@ def parse_transcript(path: Path) -> dict:
                         sub = inp.get("subagent_type") if isinstance(inp, dict) else None
                         sub = sub or "<unknown>"
                         subagent_counts[sub] = subagent_counts.get(sub, 0) + 1
+                        tu_id = block.get("id")
+                        if tu_id:
+                            pending_dispatches[tu_id] = (sub, ts)
 
     # Transcript existed but no assistant ever responded (session abandoned,
     # /clear before first turn, hook fired mid-flush). Mark as error so
@@ -272,6 +421,8 @@ def parse_transcript(path: Path) -> dict:
         "tool_calls_total": sum(tool_counts.values()),
         "tool_errors_count": tool_errors_count,
         "subagent_invocations": subagent_counts,
+        "subagent_stats": subagent_stats,
+        "cheap_subagent_calls": cheap_subagent_calls,
         "user_msg_count": user_msg_count,
         "short_user_followups_count": short_user_followups_count,
         "correction_keyword_hits": correction_keyword_hits,
@@ -356,11 +507,14 @@ def run_worker(payload: dict) -> None:
         log(f"skip: ghost session, transcript missing or empty at {transcript_path} (session_id={session_id})")
         return
 
+    git_root, git_origin_raw = _capture_git_metadata(cwd)
     row: dict = {
         "schema_version": SCHEMA_VERSION,
         "session_id": session_id,
         "ts": datetime.now(timezone.utc).isoformat(),
         "cwd": cwd,
+        "git_root": git_root,
+        "git_remote_origin": _normalize_origin(git_origin_raw),
         "end_reason": "close",
     }
 
@@ -392,6 +546,8 @@ def run_worker(payload: dict) -> None:
         "cost_usd": cost,
         "tool_errors_count": parsed["tool_errors_count"],
         "subagent_invocations": parsed["subagent_invocations"],
+        "subagent_stats": parsed["subagent_stats"],
+        "cheap_subagent_calls": parsed["cheap_subagent_calls"],
         "user_msg_count": parsed["user_msg_count"],
         "short_user_followups_count": parsed["short_user_followups_count"],
         "correction_keyword_hits": parsed["correction_keyword_hits"],
@@ -495,6 +651,8 @@ def _empty_metrics() -> dict:
         "cost_usd": None,
         "tool_errors_count": 0,
         "subagent_invocations": {},
+        "subagent_stats": {},
+        "cheap_subagent_calls": 0,
         "user_msg_count": 0,
         "short_user_followups_count": 0,
         "correction_keyword_hits": 0,

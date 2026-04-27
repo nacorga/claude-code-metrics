@@ -2,7 +2,7 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "$id": "https://github.com/nacorga/claude-code-metrics/schema/auto.schema.json",
   "title": "Auto Metrics Row",
-  "description": "One row per Claude Code SessionEnd (real close only, not compact/clear). v3 adds five conversation-shape signals: tool_errors_count, subagent_invocations, user_msg_count, short_user_followups_count, correction_keyword_hits. v2 dropped permission_mode.",
+  "description": "One row per Claude Code SessionEnd (real close only, not compact/clear). v5 adds project-identity fields (git_root, git_remote_origin) so reports can group by stable repo identity instead of cwd basename. v4 added subagent_stats and cheap_subagent_calls. v3 added five conversation-shape signals. v2 dropped permission_mode.",
   "type": "object",
   "required": [
     "schema_version",
@@ -19,14 +19,18 @@
     "cache_read_tokens",
     "cost_usd",
     "cwd",
+    "git_root",
+    "git_remote_origin",
     "tool_errors_count",
     "subagent_invocations",
+    "subagent_stats",
+    "cheap_subagent_calls",
     "user_msg_count",
     "short_user_followups_count",
     "correction_keyword_hits"
   ],
   "properties": {
-    "schema_version": { "const": 3 },
+    "schema_version": { "const": 5 },
     "session_id": { "type": "string" },
     "ts": {
       "type": "string",
@@ -56,6 +60,14 @@
       "description": "Estimated cost. null if model is unknown and no _default fallback applied."
     },
     "cwd": { "type": "string" },
+    "git_root": {
+      "type": "string",
+      "description": "v5. Absolute path of the git working tree containing cwd, or empty string if cwd is not inside a git repo. Stable across folder renames within the same repo."
+    },
+    "git_remote_origin": {
+      "type": "string",
+      "description": "v5. Normalized remote.origin.url (e.g. 'github.com/owner/repo'). Empty string if no remote is configured or cwd is not in a git repo. Stable identity for the same repo across machines."
+    },
     "tool_errors_count": {
       "type": "integer",
       "minimum": 0,
@@ -65,6 +77,27 @@
       "type": "object",
       "description": "Map of subagent_type → invocation count, captured from Agent tool_use input. Empty object if no Agent tool was used.",
       "additionalProperties": { "type": "integer", "minimum": 0 }
+    },
+    "subagent_stats": {
+      "type": "object",
+      "description": "v4. Map of subagent_type → return-surface aggregates over the session. count is the number of dispatches whose tool_result was matched (orphans without a result are excluded). return_chars_total is the cumulative size of text the subagent injected back into the main agent's context — a direct proxy for context bloat. duration_s_total sums tool_use→tool_result wall-clock per subagent. errors counts dispatches with is_error=true. Token attribution per subagent is intentionally omitted: the transcript only records main-agent usage, so per-subagent token figures cannot be derived without fabrication.",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["count", "return_chars_total", "duration_s_total", "errors", "max_return_chars", "max_duration_s"],
+        "properties": {
+          "count": { "type": "integer", "minimum": 0 },
+          "return_chars_total": { "type": "integer", "minimum": 0 },
+          "duration_s_total": { "type": "number", "minimum": 0 },
+          "errors": { "type": "integer", "minimum": 0 },
+          "max_return_chars": { "type": "integer", "minimum": 0 },
+          "max_duration_s": { "type": "number", "minimum": 0 }
+        }
+      }
+    },
+    "cheap_subagent_calls": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "v4. Number of Agent dispatches whose tool_result was under 200 chars. High counts suggest the subagent overhead (extra context window, latency) was wasted on questions answerable with a direct grep/Read."
     },
     "user_msg_count": {
       "type": "integer",

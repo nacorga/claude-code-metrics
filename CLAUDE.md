@@ -31,10 +31,11 @@ Guidance for Claude Code (and contributors) working in this repo. See [README.md
 - **Cross-platform in hook + tests.** `fcntl` restricts us to Unix (macOS + Linux). Windows is explicitly out of scope for v0.x. Never add code that silently breaks on macOS (e.g. GNU-only `date` flags).
 - **Installer patches settings.json via Python's `json` module.** Never regex-replace JSON. Always preserve other hooks and unrelated keys.
 - **Preserve user data on uninstall by default.** Only `--purge-data` may delete `~/.claude/metrics/` contents.
+- **No fabricated metrics.** The Claude Code transcript records `usage` only for the main agent; tokens consumed *inside* a subagent's own context window are not exposed. We measure subagent cost indirectly via the **return surface** (`return_chars_total`, `duration_s_total`, `errors`) — never by inventing per-subagent token figures.
 
 ## Workflow
 
-- **Before committing:** `python3 -m unittest discover tests/ -v` (must be 34+ green), then `bash -n scripts/*.sh`.
+- **Before committing:** `python3 -m unittest discover tests/ -v` (must be 90+ green), then `bash -n scripts/*.sh`.
 - **Adding a metric:** decide auto vs retro → update schema → update hook or skill → add test case → bump `schema_version`.
 
 ## Schema history
@@ -44,6 +45,8 @@ Guidance for Claude Code (and contributors) working in this repo. See [README.md
 | v1      | Initial.                                                                                                |
 | v2      | Dropped `permission_mode` (Claude Code does not send it in SessionEnd payload).                         |
 | v3      | Added five conversation-shape signals: `tool_errors_count`, `subagent_invocations`, `user_msg_count`, `short_user_followups_count`, `correction_keyword_hits`. Old v1/v2 rows coexist; `/analyze-metrics` uses `field in row` guards to gracefully skip them in v3-only sections. |
+| v4      | Added per-subagent return-surface aggregates: `subagent_stats` (count / return_chars_total / duration_s_total / errors / maxes per `subagent_type`) and `cheap_subagent_calls` (dispatches with <200-char `tool_result`). `subagent_invocations` kept additive for back-compat. v3 rows coexist; the skill guards on `"subagent_stats" in row`. |
+| v5      | Added two project-identity fields: `git_root` (absolute path of the containing git working tree) and `git_remote_origin` (normalized origin URL, e.g. `github.com/owner/repo`). Captured by the hook via `git rev-parse` / `git config --get remote.origin.url` post-fork (timeout 2s, full fallback to empty strings on any failure). Old v3/v4 rows coexist transparently — `_project_key` in `/analyze-metrics` falls back to `cwd` when git fields are missing. |
 - **Adding a model to pricing:** add a prefix entry in `config/pricing.json`. Prefix matcher picks longest-first, so more specific SKUs can be added without reordering.
 
 ## Scope rules
