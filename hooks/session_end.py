@@ -22,12 +22,14 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import re
+import subprocess
 import sys
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 # A subagent dispatch whose tool_result text is under this many characters is
 # flagged as "cheap": likely a question that could have been answered with a
@@ -95,6 +97,80 @@ def log(msg: str) -> None:
             f.write(f"[{datetime.now(timezone.utc).isoformat()}] {msg}\n")
     except Exception:
         pass
+
+
+# v5. Project-identity helpers. Captured per-session in run_worker so reports
+# can group by stable repo identity instead of cwd basename. Pure best-effort:
+# any failure (no git, no repo, no remote, broken URL) yields empty strings —
+# the row stays valid and legacy behaviour (cwd-based grouping) takes over.
+_SSH_ORIGIN = re.compile(r"^[A-Za-z0-9_-]+@([^:]+):(.+)$")
+_URL_ORIGIN = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*://(?:[^@/]+@)?([^/]+)/(.+)$")
+
+
+def _normalize_origin(url: str) -> str:
+    """Normalize a git remote.origin.url into a stable 'host/owner/repo' key.
+
+    Handles SSH (`git@github.com:foo/bar.git`), HTTPS with optional auth
+    (`https://user@github.com/foo/bar.git`), and ssh:// / git:// schemes.
+    Strips the trailing `.git`. Falls back to the raw input (minus `.git`) for
+    shapes we don't recognize (file://, custom hosts) — never invents a value.
+    """
+    if not url:
+        return ""
+    s = url.strip()
+    if not s:
+        return ""
+    if s.endswith(".git"):
+        s = s[:-4]
+    m = _SSH_ORIGIN.match(s)
+    if m:
+        return f"{m.group(1)}/{m.group(2)}"
+    m = _URL_ORIGIN.match(s)
+    if m:
+        return f"{m.group(1)}/{m.group(2)}"
+    return s
+
+
+def _capture_git_metadata(cwd: str) -> tuple[str, str]:
+    """Return (git_root, raw_origin_url) for cwd. Both empty when cwd is not
+    inside a git repo, no origin is configured, or git is unavailable.
+
+    Runs only inside the detached worker (post double-fork), so the 2s
+    timeout cannot stall Claude Code's session close. Common failure modes
+    (cwd outside a repo, missing remote) are silent — only unexpected
+    exceptions log to hook.log.
+    """
+    if not cwd:
+        return "", ""
+    try:
+        if not Path(cwd).is_dir():
+            return "", ""
+    except OSError:
+        return "", ""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", cwd, "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, timeout=2,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as e:
+        log(f"git rev-parse failed at {cwd}: {e}")
+        return "", ""
+    if proc.returncode != 0:
+        return "", ""
+    git_root = proc.stdout.strip()
+    if not git_root:
+        return "", ""
+    try:
+        proc2 = subprocess.run(
+            ["git", "-C", git_root, "config", "--get", "remote.origin.url"],
+            capture_output=True, text=True, timeout=2,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as e:
+        log(f"git config failed at {git_root}: {e}")
+        return git_root, ""
+    if proc2.returncode != 0:
+        return git_root, ""
+    return git_root, proc2.stdout.strip()
 
 
 def load_pricing() -> dict:
@@ -426,11 +502,14 @@ def run_worker(payload: dict) -> None:
         log(f"skip: ghost session, transcript missing or empty at {transcript_path} (session_id={session_id})")
         return
 
+    git_root, git_origin_raw = _capture_git_metadata(cwd)
     row: dict = {
         "schema_version": SCHEMA_VERSION,
         "session_id": session_id,
         "ts": datetime.now(timezone.utc).isoformat(),
         "cwd": cwd,
+        "git_root": git_root,
+        "git_remote_origin": _normalize_origin(git_origin_raw),
         "end_reason": "close",
     }
 

@@ -1,12 +1,27 @@
 ---
 name: analyze-metrics
-description: Read ~/.claude/metrics/{auto,retro}.jsonl, left-join by session_id, and render a markdown report to stdout with totals, cost breakdowns, and correlation tables. Manual invocation.
+description: Read ~/.claude/metrics/{auto,retro}.jsonl, left-join by session_id, and render a markdown report to stdout. Default window is the last 30 days; pass --since <window> and/or --project <name> to scope the report. Manual invocation.
 disable-model-invocation: true
 ---
 
 # /analyze-metrics
 
 Summarise the local metrics JSONL files. Read-only — writes nothing to disk.
+
+## Arguments
+
+```
+/analyze-metrics                                    # default: last 30 days, all projects
+/analyze-metrics --since 7d                         # last 7 days
+/analyze-metrics --since 90d                        # last 90 days
+/analyze-metrics --since all                        # full history (legacy default)
+/analyze-metrics --since 2026-01-01                 # explicit ISO date (UTC)
+/analyze-metrics --project foo/bar                  # only sessions in that repo
+/analyze-metrics --project github.com/foo/bar       # match by full normalized origin
+/analyze-metrics --project foo --since 90d          # combined
+```
+
+`--project` matches at any granularity: full origin (`github.com/foo/bar`), label (`foo/bar`), git root path, cwd, or basename of either path. Substring matches are intentionally rejected to avoid silently merging unrelated repos.
 
 ## Steps
 
@@ -15,17 +30,38 @@ Summarise the local metrics JSONL files. Read-only — writes nothing to disk.
 2. **Run the report.** Use this exact script (deterministic output — no LLM summarisation of the numbers):
 
    ```bash
+   CCM_FILTER_SINCE="$(echo "${ARGUMENTS:-}" | grep -oE '\-\-since[= ][^ ]+' | sed -E 's/^--since[= ]//' | tail -n1)" \
+   CCM_FILTER_PROJECT="$(echo "${ARGUMENTS:-}" | grep -oE '\-\-project[= ][^ ]+' | sed -E 's/^--project[= ]//' | tail -n1)" \
    python3 - <<'PY'
-   import json, os, statistics
+   import json, os, statistics, sys
    from collections import Counter, defaultdict
    from pathlib import Path
+
+   # Helpers live next to this SKILL when installed (~/.claude/skills/analyze-metrics).
+   # The heredoc has no __file__, so resolve via the canonical install path.
+   _SKILL_DIR = Path.home() / ".claude" / "skills" / "analyze-metrics"
+   sys.path.insert(0, str(_SKILL_DIR))
+   from _helpers import (
+       _parse_since, _window_label, _row_ts,
+       _project_key, _project_label, _project_matches,
+   )
 
    m = Path.home() / ".claude" / "metrics"
    raw = [json.loads(l) for l in (m / "auto.jsonl").read_text().splitlines() if l.strip()]
    # Error rows (no_transcript, parse_crash, etc.) are counted but excluded
    # from aggregates — they'd skew averages with zero-cost zero-turn noise.
-   auto = [a for a in raw if not a.get("error")]
-   err_count = len(raw) - len(auto)
+   auto_all = [a for a in raw if not a.get("error")]
+   err_count = len(raw) - len(auto_all)
+
+   since_raw = (os.environ.get("CCM_FILTER_SINCE") or "").strip() or None
+   proj_raw = (os.environ.get("CCM_FILTER_PROJECT") or "").strip() or None
+   cutoff = _parse_since(since_raw, default_days=30)
+
+   auto = list(auto_all)
+   if cutoff is not None:
+       auto = [a for a in auto if (_row_ts(a) is not None and _row_ts(a) >= cutoff)]
+   if proj_raw:
+       auto = [a for a in auto if _project_matches(a, proj_raw)]
 
    retro_path = m / "retro.jsonl"
    retro = []
@@ -43,11 +79,19 @@ Summarise the local metrics JSONL files. Read-only — writes nothing to disk.
        return "\n".join(out)
 
    print("# claude-code-metrics report\n")
-   print(f"- sessions (real): **{len(auto)}**")
+   print(f"**Window:** {_window_label(since_raw, default_days=30)}  ·  **Project filter:** {proj_raw or 'all'}")
+   all_costs = [a.get("cost_usd") for a in auto_all if a.get("cost_usd") is not None]
+   print(f"_All-time: {len(auto_all)} sessions, ${sum(all_costs):.4f} total cost_\n")
+
+   if not auto:
+       print("_no sessions match the current filter — try `--since all` or a different `--project`._")
+       sys.exit(0)
+
+   print(f"- sessions in window: **{len(auto)}**")
    if err_count:
        print(f"- error rows excluded: **{err_count}** (no transcript / parse crash)")
    costs = [a["cost_usd"] for a in auto if a.get("cost_usd") is not None]
-   print(f"- total estimated cost: **${sum(costs):.4f}**")
+   print(f"- total estimated cost in window: **${sum(costs):.4f}**")
    print(f"- sessions with retro: **{len(retro)} / {len(auto)}**")
    ts = sorted(a["ts"] for a in auto if a.get("ts"))
    if ts:
@@ -107,24 +151,37 @@ Summarise the local metrics JSONL files. Read-only — writes nothing to disk.
    if ranked:
        rows = []
        for a in ranked:
-           cwd = (a.get("cwd") or "").split("/")[-1] or "-"
+           proj_label = _project_label(_project_key(a)) or "-"
            outcome = retro_by_id.get(a["session_id"], {}).get("task_outcome", "-")
-           rows.append((a["session_id"][:12], f"${a['cost_usd']:.4f}", outcome, cwd))
+           rows.append((a["session_id"][:12], f"${a['cost_usd']:.4f}", outcome, proj_label))
        print(table(["session_id", "cost", "outcome", "project"], rows))
    else:
        print("_no cost data_")
    print()
 
-   # Cost by project (cwd basename)
-   by_proj = defaultdict(list)
+   # Cost by project. Grouped by canonical project key (origin > git_root >
+   # cwd) so two repos with the same basename never collide. The displayed
+   # label is the human-friendly form; if two distinct keys collapse to the
+   # same label, disambiguate with a short suffix from the key.
+   by_proj_key = defaultdict(list)
    for a in auto:
        if a.get("cost_usd") is not None:
-           proj = (a.get("cwd") or "unknown").split("/")[-1] or "unknown"
-           by_proj[proj].append(a["cost_usd"])
+           by_proj_key[_project_key(a)].append(a["cost_usd"])
+   label_keys = defaultdict(list)
+   for k in by_proj_key:
+       label_keys[_project_label(k)].append(k)
+   def _disambiguated_label(k):
+       label = _project_label(k)
+       if len(label_keys[label]) <= 1:
+           return label
+       suffix = k[-8:] if len(k) > 8 else k
+       return f"{label} ({suffix})"
    print("## Cost by project\n")
-   if by_proj:
+   if by_proj_key:
        rows = sorted(
-           ((p, len(v), f"${statistics.mean(v):.4f}", f"${sum(v):.4f}") for p, v in by_proj.items()),
+           ((_disambiguated_label(k), len(v),
+             f"${statistics.mean(v):.4f}", f"${sum(v):.4f}")
+            for k, v in by_proj_key.items()),
            key=lambda r: float(r[3].lstrip("$")), reverse=True
        )
        print(table(["project", "sessions", "avg cost", "total"], rows))
@@ -214,10 +271,10 @@ Summarise the local metrics JSONL files. Read-only — writes nothing to disk.
    if marathons:
        rows = []
        for a in marathons:
-           cwd = (a.get("cwd") or "").split("/")[-1] or "-"
+           proj_label = _project_label(_project_key(a)) or "-"
            cost = a.get("cost_usd") or 0
            tools = a.get("tool_calls_total") or 0
-           rows.append((a["session_id"][:12], a.get("turn_count"), tools, f"${cost:.2f}", cwd))
+           rows.append((a["session_id"][:12], a.get("turn_count"), tools, f"${cost:.2f}", proj_label))
        print(table(["session_id", "turns", "tool calls", "cost", "project"], rows))
        print()
        n = len(marathons)
@@ -355,13 +412,13 @@ Summarise the local metrics JSONL files. Read-only — writes nothing to disk.
            if offenders:
                rows = []
                for a in offenders:
-                   cwd = (a.get("cwd") or "").split("/")[-1] or "-"
+                   proj_label = _project_label(_project_key(a)) or "-"
                    cost = a.get("cost_usd") or 0
                    rows.append((
                        a["session_id"][:12],
                        a.get("cheap_subagent_calls") or 0,
                        f"${cost:.2f}",
-                       cwd,
+                       proj_label,
                    ))
                print(table(["session_id", "cheap calls", "cost", "project"], rows))
    print()
@@ -373,9 +430,9 @@ Summarise the local metrics JSONL files. Read-only — writes nothing to disk.
    if v3_with_errors:
        rows = []
        for a in v3_with_errors[:10]:
-           cwd = (a.get("cwd") or "").split("/")[-1] or "-"
+           proj_label = _project_label(_project_key(a)) or "-"
            cost = a.get("cost_usd") or 0
-           rows.append((a["session_id"][:12], a.get("tool_errors_count"), f"${cost:.2f}", cwd))
+           rows.append((a["session_id"][:12], a.get("tool_errors_count"), f"${cost:.2f}", proj_label))
        print(table(["session_id", "errors", "cost", "project"], rows))
        total_err = sum(a.get("tool_errors_count") or 0 for a in auto)
        v3_count = sum(1 for a in auto if "tool_errors_count" in a)
@@ -398,14 +455,14 @@ Summarise the local metrics JSONL files. Read-only — writes nothing to disk.
    if v3_corr:
        rows = []
        for a in v3_corr[:10]:
-           cwd = (a.get("cwd") or "").split("/")[-1] or "-"
+           proj_label = _project_label(_project_key(a)) or "-"
            cost = a.get("cost_usd") or 0
            rows.append((
                a["session_id"][:12],
                a.get("short_user_followups_count") or 0,
                a.get("correction_keyword_hits") or 0,
                f"${cost:.2f}",
-               cwd,
+               proj_label,
            ))
        print(table(["session_id", "short_fups", "kw_hits", "cost", "project"], rows))
    elif any("short_user_followups_count" in a for a in auto):

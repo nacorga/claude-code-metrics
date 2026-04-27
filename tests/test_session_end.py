@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -20,6 +21,13 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 HOOK = REPO / "hooks" / "session_end.py"
 AUTO_SCHEMA = REPO / "schema" / "auto.schema.json"
+
+# Import the hook module directly for unit-testing pure helpers (no subprocess
+# round-trip). Safe: session_end.py guards its main() behind __name__ check.
+sys.path.insert(0, str(REPO / "hooks"))
+import session_end  # noqa: E402
+
+GIT_AVAILABLE = shutil.which("git") is not None
 
 
 def run_hook(payload: dict, home: Path, fork: bool = False) -> subprocess.CompletedProcess:
@@ -110,7 +118,7 @@ class TestSessionEndHook(unittest.TestCase):
         rows = read_jsonl(self.auto_path)
         self.assertEqual(len(rows), 1)
         row = rows[0]
-        self.assertEqual(row["schema_version"], 4)
+        self.assertEqual(row["schema_version"], 5)
         self.assertEqual(row["session_id"], "s-happy")
         self.assertEqual(row["model"], "claude-sonnet-4-5")
         self.assertEqual(row["turn_count"], 2)
@@ -657,6 +665,164 @@ class TestSessionEndHook(unittest.TestCase):
         self.assertEqual(rows[0]["error"], "empty_transcript")
         self.assertEqual(rows[0]["turn_count"], 0)
         self.assertIsNone(rows[0]["cost_usd"])
+
+
+class TestNormalizeOrigin(unittest.TestCase):
+    """Pure unit tests for session_end._normalize_origin. No filesystem,
+    no subprocess. Locks the SSH/HTTPS/auth/scheme normalisation contract
+    against accidental drift."""
+
+    def test_ssh_form(self):
+        self.assertEqual(
+            session_end._normalize_origin("git@github.com:foo/bar.git"),
+            "github.com/foo/bar",
+        )
+
+    def test_https_form(self):
+        self.assertEqual(
+            session_end._normalize_origin("https://github.com/foo/bar.git"),
+            "github.com/foo/bar",
+        )
+
+    def test_https_with_user_strips_auth(self):
+        self.assertEqual(
+            session_end._normalize_origin("https://user@github.com/foo/bar.git"),
+            "github.com/foo/bar",
+        )
+
+    def test_https_with_token_strips_auth(self):
+        self.assertEqual(
+            session_end._normalize_origin("https://user:token@gitlab.com/g/h.git"),
+            "gitlab.com/g/h",
+        )
+
+    def test_ssh_scheme(self):
+        self.assertEqual(
+            session_end._normalize_origin("ssh://git@github.com/foo/bar.git"),
+            "github.com/foo/bar",
+        )
+
+    def test_already_normalized_passthrough(self):
+        # 'github.com/foo/bar' has no scheme and no SSH ':' — should pass
+        # through unchanged so the function is idempotent.
+        self.assertEqual(
+            session_end._normalize_origin("github.com/foo/bar"),
+            "github.com/foo/bar",
+        )
+
+    def test_empty_input(self):
+        self.assertEqual(session_end._normalize_origin(""), "")
+        self.assertEqual(session_end._normalize_origin("   "), "")
+
+    def test_unknown_form_falls_back(self):
+        # file:// and other shapes we don't recognise: strip .git but
+        # otherwise keep the input — never invent a value.
+        self.assertEqual(
+            session_end._normalize_origin("file:///srv/git/local.git"),
+            "file:///srv/git/local",
+        )
+
+
+@unittest.skipUnless(GIT_AVAILABLE, "git not installed")
+class TestCaptureGitMetadata(unittest.TestCase):
+    """End-to-end via the hook: a real git repo in a tempdir, run the hook,
+    inspect the row. Skipped if git is not on PATH (rare on CI but possible)."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self.tmp.name) / "home"
+        self.home.mkdir()
+        self.auto_path = self.home / ".claude" / "metrics" / "auto.jsonl"
+        self.repo_dir = Path(self.tmp.name) / "repo"
+        self.repo_dir.mkdir()
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def _git(self, *args: str, cwd: Path | None = None) -> None:
+        subprocess.run(
+            ["git", *args],
+            cwd=str(cwd or self.repo_dir),
+            capture_output=True,
+            check=True,
+        )
+
+    def _write_minimal_transcript(self) -> Path:
+        transcript = self.home / "t.jsonl"
+        write_transcript(transcript, [
+            make_assistant("claude-sonnet-4-5", "2026-04-14T10:00:00Z",
+                           input_t=100, output_t=50, tools=["Read"]),
+        ])
+        return transcript
+
+    def test_repo_with_remote_captures_normalized_origin(self):
+        self._git("init", "-q")
+        self._git("remote", "add", "origin", "git@github.com:foo/bar.git")
+        transcript = self._write_minimal_transcript()
+        run_hook({
+            "hook_event_name": "SessionEnd",
+            "session_id": "s-git-ssh",
+            "transcript_path": str(transcript),
+            "cwd": str(self.repo_dir),
+        }, self.home)
+        row = read_jsonl(self.auto_path)[0]
+        # git_root may be the repo dir or its realpath (macOS /private/var
+        # symlink). Compare via resolve() to absorb that.
+        self.assertEqual(Path(row["git_root"]).resolve(), self.repo_dir.resolve())
+        self.assertEqual(row["git_remote_origin"], "github.com/foo/bar")
+
+    def test_repo_without_remote_captures_root_only(self):
+        self._git("init", "-q")
+        transcript = self._write_minimal_transcript()
+        run_hook({
+            "hook_event_name": "SessionEnd",
+            "session_id": "s-git-noremote",
+            "transcript_path": str(transcript),
+            "cwd": str(self.repo_dir),
+        }, self.home)
+        row = read_jsonl(self.auto_path)[0]
+        self.assertEqual(Path(row["git_root"]).resolve(), self.repo_dir.resolve())
+        self.assertEqual(row["git_remote_origin"], "")
+
+    def test_outside_repo_yields_empty_strings(self):
+        # Plain dir, never `git init`-ed. Both fields must be empty strings —
+        # not null, not missing — so the row stays schema-valid.
+        transcript = self._write_minimal_transcript()
+        run_hook({
+            "hook_event_name": "SessionEnd",
+            "session_id": "s-no-git",
+            "transcript_path": str(transcript),
+            "cwd": str(self.repo_dir),
+        }, self.home)
+        row = read_jsonl(self.auto_path)[0]
+        self.assertEqual(row["git_root"], "")
+        self.assertEqual(row["git_remote_origin"], "")
+
+    def test_nonexistent_cwd_yields_empty_strings(self):
+        transcript = self._write_minimal_transcript()
+        run_hook({
+            "hook_event_name": "SessionEnd",
+            "session_id": "s-bad-cwd",
+            "transcript_path": str(transcript),
+            "cwd": "/this/does/not/exist",
+        }, self.home)
+        row = read_jsonl(self.auto_path)[0]
+        self.assertEqual(row["git_root"], "")
+        self.assertEqual(row["git_remote_origin"], "")
+
+    def test_https_remote_normalised(self):
+        self._git("init", "-q")
+        self._git("remote", "add", "origin",
+                  "https://github.com/foo/bar.git")
+        transcript = self._write_minimal_transcript()
+        run_hook({
+            "hook_event_name": "SessionEnd",
+            "session_id": "s-git-https",
+            "transcript_path": str(transcript),
+            "cwd": str(self.repo_dir),
+        }, self.home)
+        row = read_jsonl(self.auto_path)[0]
+        self.assertEqual(row["git_remote_origin"], "github.com/foo/bar")
 
 
 if __name__ == "__main__":

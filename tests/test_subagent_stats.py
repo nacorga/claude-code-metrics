@@ -103,14 +103,16 @@ class TestSubagentStats(unittest.TestCase):
         self.assertEqual(len(rows), 1, f"expected exactly one row for {session_id}")
         return rows[0]
 
-    def test_schema_version_bumped_to_v4(self):
+    def test_schema_version_is_current_and_v4_fields_present(self):
         row = self._run([
             {"type": "user", "timestamp": "2026-04-14T10:00:00Z",
              "message": {"role": "user", "content": "hi"}},
             assistant_with_agent("2026-04-14T10:00:01Z", "toolu_a", "Explore"),
             tool_result_user("2026-04-14T10:00:30Z", "toolu_a", "x" * 4000),
         ], "s-v4")
-        self.assertEqual(row["schema_version"], 4)
+        # Schema is at v5 (project-identity fields). v4 return-surface fields
+        # are still required and populated — additive.
+        self.assertEqual(row["schema_version"], 5)
         self.assertIn("subagent_stats", row)
         self.assertIn("cheap_subagent_calls", row)
 
