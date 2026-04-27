@@ -19,7 +19,7 @@ This repo gives you a 2-file answer: a **SessionEnd hook** that captures objecti
 ## Quickstart
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/claude-code-metrics.git
+git clone https://github.com/nacorga/claude-code-metrics.git
 cd claude-code-metrics
 ./scripts/install.sh
 ```
