@@ -32,6 +32,8 @@ At the end of a session (optional but recommended), run:
 /retrospective
 ```
 
+`/retrospective` reads the session's auto-captured row first and shows you `cost_usd`, `tool_errors_count`, `correction_keyword_hits`, etc. before asking for your subjective rating — you confirm with two numbers, not a guess in the dark.
+
 And whenever you want to see your data:
 
 ```
@@ -51,14 +53,24 @@ And whenever you want to see your data:
 
 Every real session close appends one row with:
 
+**Identity & shape**
 - `session_id`, `ts`, `cwd`, `end_reason`
 - `duration_s`, `turn_count`, `tool_calls_total`, `tool_distribution`
+
+**Tokens & cost**
 - `model`, `input_tokens`, `output_tokens`, `cache_creation_tokens`, `cache_read_tokens`
 - `cost_usd` (estimated from `config/pricing.json`)
 
+**Conversation-shape signals (v3+)**
+- `tool_errors_count` — `tool_result` blocks with `is_error=true` (failing tools / retry loops)
+- `subagent_invocations` — map of `subagent_type` → count, captured from `Agent` tool calls (e.g. `{"Explore": 5, "Plan": 1}`)
+- `user_msg_count` — user-authored text messages (excludes synthetic `tool_result`-only entries)
+- `short_user_followups_count` — user messages (after the first) under 200 chars; high counts suggest steering with short corrections rather than full prompts
+- `correction_keyword_hits` — user messages matching a conservative English keyword set (`undo`, `revert`, `rollback`, `redo`, `incorrect`, `wrong`, `broken`, `doesn't work`, `not what i asked/wanted`); heuristic, intended as a hint for `/retrospective` pre-fill, not as a strict correction rate
+
 `/compact` and `/clear` are filtered out — only real session ends are recorded.
 
-See [`schema/auto.schema.json`](./schema/auto.schema.json) and [`schema/retro.schema.json`](./schema/retro.schema.json) for the full shapes.
+See [`schema/auto.schema.json`](./schema/auto.schema.json) and [`schema/retro.schema.json`](./schema/retro.schema.json) for the full shapes. Schema history lives in [`CLAUDE.md`](./CLAUDE.md#schema-history).
 
 ## Uninstall
 

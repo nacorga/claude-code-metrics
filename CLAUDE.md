@@ -10,6 +10,7 @@ Guidance for Claude Code (and contributors) working in this repo. See [README.md
 - **Never block Claude Code.** The hook must always `exit 0`, even on crashes. Any failure logs to `~/.claude/metrics/hook.log` and moves on.
 - **Return to the shell in <100ms.** Heavy work (transcript parsing) runs in a double-forked, detached grandchild. Large sessions (60MB+ transcripts) cannot stall session close. Set `CCM_NO_FORK=1` for synchronous execution (tests).
 - **Append-only.** We never rewrite `auto.jsonl` / `retro.jsonl`. Migrations happen by bumping `schema_version` and letting old + new rows coexist.
+- **Repo SKILL.md is ground truth, not the installed copy.** `~/.claude/skills/{retrospective,analyze-metrics}/SKILL.md` are install artefacts. Edits made directly there are lost on the next `scripts/install.sh`. Always edit the repo source and re-install.
 
 ## Critical files
 
@@ -33,8 +34,16 @@ Guidance for Claude Code (and contributors) working in this repo. See [README.md
 
 ## Workflow
 
-- **Before committing:** `python3 -m unittest discover tests/ -v` (must be 21+ green), then `bash -n scripts/*.sh`.
+- **Before committing:** `python3 -m unittest discover tests/ -v` (must be 34+ green), then `bash -n scripts/*.sh`.
 - **Adding a metric:** decide auto vs retro → update schema → update hook or skill → add test case → bump `schema_version`.
+
+## Schema history
+
+| Version | Change                                                                                                  |
+| ------- | ------------------------------------------------------------------------------------------------------- |
+| v1      | Initial.                                                                                                |
+| v2      | Dropped `permission_mode` (Claude Code does not send it in SessionEnd payload).                         |
+| v3      | Added five conversation-shape signals: `tool_errors_count`, `subagent_invocations`, `user_msg_count`, `short_user_followups_count`, `correction_keyword_hits`. Old v1/v2 rows coexist; `/analyze-metrics` uses `field in row` guards to gracefully skip them in v3-only sections. |
 - **Adding a model to pricing:** add a prefix entry in `config/pricing.json`. Prefix matcher picks longest-first, so more specific SKUs can be added without reordering.
 
 ## Scope rules

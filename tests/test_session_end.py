@@ -110,7 +110,7 @@ class TestSessionEndHook(unittest.TestCase):
         rows = read_jsonl(self.auto_path)
         self.assertEqual(len(rows), 1)
         row = rows[0]
-        self.assertEqual(row["schema_version"], 2)
+        self.assertEqual(row["schema_version"], 3)
         self.assertEqual(row["session_id"], "s-happy")
         self.assertEqual(row["model"], "claude-sonnet-4-5")
         self.assertEqual(row["turn_count"], 2)
@@ -124,6 +124,13 @@ class TestSessionEndHook(unittest.TestCase):
         self.assertGreater(row["cost_usd"], 0)
         self.assertEqual(row["end_reason"], "close")
         self.assertNotIn("error", row)
+        # v3 signals: this fixture has one short benign user msg ("hi"), no
+        # tool errors, no Agent calls, no correction keywords.
+        self.assertEqual(row["user_msg_count"], 1)
+        self.assertEqual(row["short_user_followups_count"], 0)
+        self.assertEqual(row["tool_errors_count"], 0)
+        self.assertEqual(row["subagent_invocations"], {})
+        self.assertEqual(row["correction_keyword_hits"], 0)
 
     # --- skip conditions ----------------------------------------------------
 
@@ -495,6 +502,141 @@ class TestSessionEndHook(unittest.TestCase):
         }, self.home)
         rows = read_jsonl(self.auto_path)
         self.assertEqual(rows[0]["duration_s"], 600.0)
+
+    # --- v3 conversation-shape signals --------------------------------------
+
+    def test_v3_signals_captured_from_full_transcript(self):
+        """End-to-end check that the five v3 signals are extracted correctly:
+        tool_errors_count, subagent_invocations, user_msg_count,
+        short_user_followups_count, correction_keyword_hits."""
+        transcript = self.home / "t.jsonl"
+        long_first_prompt = "Please audit the codebase and tell me " + ("x" * 250)
+
+        entries = [
+            # First user message (long → not a follow-up).
+            {"type": "user", "timestamp": "2026-04-14T10:00:00Z",
+             "message": {"role": "user", "content": long_first_prompt}},
+            # Assistant dispatches an Explore subagent.
+            {"type": "assistant", "timestamp": "2026-04-14T10:00:05Z",
+             "message": {
+                 "model": "claude-sonnet-4-5",
+                 "usage": {"input_tokens": 100, "output_tokens": 50,
+                           "cache_creation_input_tokens": 0,
+                           "cache_read_input_tokens": 0},
+                 "content": [
+                     {"type": "tool_use", "name": "Agent",
+                      "input": {"subagent_type": "Explore",
+                                "description": "map repo"}},
+                     {"type": "tool_use", "name": "Read"},
+                 ],
+             }},
+            # Synthetic user entry with a tool_error.
+            {"type": "user", "timestamp": "2026-04-14T10:00:10Z",
+             "message": {"role": "user", "content": [
+                 {"type": "tool_result", "tool_use_id": "x", "is_error": True,
+                  "content": "tool failed"},
+             ]}},
+            # Short user follow-up — should count as steering nudge.
+            {"type": "user", "timestamp": "2026-04-14T10:00:15Z",
+             "message": {"role": "user", "content": [
+                 {"type": "text", "text": "undo that, the change is wrong"},
+             ]}},
+            # Another assistant turn with a second Agent dispatch.
+            {"type": "assistant", "timestamp": "2026-04-14T10:00:20Z",
+             "message": {
+                 "model": "claude-sonnet-4-5",
+                 "usage": {"input_tokens": 50, "output_tokens": 25,
+                           "cache_creation_input_tokens": 0,
+                           "cache_read_input_tokens": 0},
+                 "content": [
+                     {"type": "tool_use", "name": "Agent",
+                      "input": {"subagent_type": "Plan",
+                                "description": "plan fix"}},
+                 ],
+             }},
+            # System-injected user prompt — must NOT count toward followups.
+            {"type": "user", "timestamp": "2026-04-14T10:00:25Z",
+             "message": {"role": "user", "content": "<system-reminder>x</system-reminder>"}},
+            # Another short user follow-up with a correction keyword.
+            {"type": "user", "timestamp": "2026-04-14T10:00:30Z",
+             "message": {"role": "user", "content": [
+                 {"type": "text", "text": "this is incorrect, please redo"},
+             ]}},
+        ]
+        write_transcript(transcript, entries)
+
+        run_hook({
+            "hook_event_name": "SessionEnd",
+            "session_id": "s-v3",
+            "transcript_path": str(transcript),
+            "cwd": "/x",
+        }, self.home)
+        rows = read_jsonl(self.auto_path)
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+
+        # 4 user-text msgs total: long_first + "undo that..." + system + "this is incorrect..."
+        # System-injected starts with "<" → still counts as a user msg
+        # (it has user-authored shape) but is excluded from short follow-up tally.
+        self.assertEqual(row["user_msg_count"], 4)
+        # Short followups (user_msg_count > 1, len < 200, not system-injected):
+        # "undo that, the change is wrong" + "this is incorrect, please redo" = 2
+        self.assertEqual(row["short_user_followups_count"], 2)
+        # 1 tool_result with is_error=true
+        self.assertEqual(row["tool_errors_count"], 1)
+        # 2 Agent calls: Explore + Plan
+        self.assertEqual(row["subagent_invocations"], {"Explore": 1, "Plan": 1})
+        # Correction keyword hits: "undo that, the change is wrong" matches
+        # ("undo", "wrong"); "this is incorrect, please redo" matches
+        # ("incorrect", "redo"). Counted per matching message → 2.
+        self.assertEqual(row["correction_keyword_hits"], 2)
+        # Sanity on existing aggregates
+        self.assertEqual(row["turn_count"], 2)
+        self.assertEqual(row["tool_distribution"], {"Agent": 2, "Read": 1})
+        self.assertEqual(row["tool_calls_total"], 3)
+
+    def test_v3_signals_zero_on_assistant_only_transcript(self):
+        """Sessions with no user-authored text and no tool errors should
+        still emit the v3 fields with zero/empty defaults."""
+        transcript = self.home / "t.jsonl"
+        write_transcript(transcript, [
+            make_assistant("claude-sonnet-4-5", "2026-01-01T00:00:00Z",
+                           input_t=100, output_t=50, tools=["Read"]),
+        ])
+        run_hook({
+            "hook_event_name": "SessionEnd",
+            "session_id": "s-v3-zero",
+            "transcript_path": str(transcript),
+            "cwd": "/x",
+        }, self.home)
+        row = read_jsonl(self.auto_path)[0]
+        self.assertEqual(row["user_msg_count"], 0)
+        self.assertEqual(row["short_user_followups_count"], 0)
+        self.assertEqual(row["tool_errors_count"], 0)
+        self.assertEqual(row["subagent_invocations"], {})
+        self.assertEqual(row["correction_keyword_hits"], 0)
+
+    def test_v3_signals_present_on_error_row(self):
+        """Error rows (empty_transcript / parse_crash) must include v3 fields
+        as zero/empty so the schema stays valid."""
+        transcript = self.home / "t.jsonl"
+        write_transcript(transcript, [
+            {"type": "user", "timestamp": "2026-01-01T00:00:00Z",
+             "message": {"content": "hi"}},
+        ])
+        run_hook({
+            "hook_event_name": "SessionEnd",
+            "session_id": "s-v3-err",
+            "transcript_path": str(transcript),
+            "cwd": "/x",
+        }, self.home)
+        row = read_jsonl(self.auto_path)[0]
+        self.assertEqual(row["error"], "empty_transcript")
+        self.assertEqual(row["tool_errors_count"], 0)
+        self.assertEqual(row["subagent_invocations"], {})
+        self.assertEqual(row["user_msg_count"], 0)
+        self.assertEqual(row["short_user_followups_count"], 0)
+        self.assertEqual(row["correction_keyword_hits"], 0)
 
     def test_empty_transcript_is_marked_error(self):
         """Transcript with timestamps but zero assistant turns must be

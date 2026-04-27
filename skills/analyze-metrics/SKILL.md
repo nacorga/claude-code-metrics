@@ -113,6 +113,168 @@ Summarise the local metrics JSONL files. Read-only — writes nothing to disk.
        print(table(["session_id", "cost", "outcome", "project"], rows))
    else:
        print("_no cost data_")
+   print()
+
+   # Cost by project (cwd basename)
+   by_proj = defaultdict(list)
+   for a in auto:
+       if a.get("cost_usd") is not None:
+           proj = (a.get("cwd") or "unknown").split("/")[-1] or "unknown"
+           by_proj[proj].append(a["cost_usd"])
+   print("## Cost by project\n")
+   if by_proj:
+       rows = sorted(
+           ((p, len(v), f"${statistics.mean(v):.4f}", f"${sum(v):.4f}") for p, v in by_proj.items()),
+           key=lambda r: float(r[3].lstrip("$")), reverse=True
+       )
+       print(table(["project", "sessions", "avg cost", "total"], rows))
+   else:
+       print("_no cost data_")
+   print()
+
+   # Cache efficiency by model — read/(read+create); low ratio means context is being rebuilt repeatedly
+   print("## Cache efficiency by model\n")
+   cache_by_model = defaultdict(lambda: [0, 0])  # [read, create]
+   for a in auto:
+       m_ = a.get("model") or "unknown"
+       cache_by_model[m_][0] += a.get("cache_read_tokens") or 0
+       cache_by_model[m_][1] += a.get("cache_creation_tokens") or 0
+   rows = []
+   for m_, (r, c) in sorted(cache_by_model.items()):
+       if r + c == 0:
+           rows.append((m_, "-", f"{r:,}", f"{c:,}"))
+       else:
+           pct = r / (r + c) * 100
+           rows.append((m_, f"{pct:.1f}%", f"{r:,}", f"{c:,}"))
+   print(table(["model", "hit rate", "cache_read", "cache_create"], rows) if rows else "_no data_")
+   print()
+
+   # Marathon sessions — turn_count > 300 indicates autonomous runs that drift expensive
+   print("## Marathon sessions (turn_count > 300)\n")
+   marathons = sorted(
+       (a for a in auto if (a.get("turn_count") or 0) > 300),
+       key=lambda x: x.get("cost_usd") or 0, reverse=True
+   )[:10]
+   if marathons:
+       rows = []
+       for a in marathons:
+           cwd = (a.get("cwd") or "").split("/")[-1] or "-"
+           cost = a.get("cost_usd") or 0
+           tools = a.get("tool_calls_total") or 0
+           rows.append((a["session_id"][:12], a.get("turn_count"), tools, f"${cost:.2f}", cwd))
+       print(table(["session_id", "turns", "tool calls", "cost", "project"], rows))
+       print()
+       n = len(marathons)
+       total_cost = sum(a.get("cost_usd") or 0 for a in auto if (a.get("turn_count") or 0) > 300)
+       all_cost = sum(costs)
+       pct = total_cost / all_cost * 100 if all_cost else 0
+       print(f"_{n} marathon sessions account for ${total_cost:.2f} ({pct:.1f}% of total spend)._")
+   else:
+       print("_no marathon sessions detected_")
+   print()
+
+   # Top tools across ALL sessions — aggregated tool_distribution
+   print("## Top tools across all sessions\n")
+   tool_totals = Counter()
+   for a in auto:
+       td = a.get("tool_distribution") or {}
+       for t, c in td.items():
+           tool_totals[t] += c
+   if tool_totals:
+       rows = [(t, n) for t, n in tool_totals.most_common(15)]
+       print(table(["tool", "total calls"], rows))
+   else:
+       print("_no tool data_")
+   print()
+
+   # Subagent usage (v3+) — only available on rows captured by the v3 hook
+   print("## Subagent invocations (v3+ rows only)\n")
+   sub_totals = Counter()
+   v3_rows = 0
+   for a in auto:
+       if "subagent_invocations" in a:
+           v3_rows += 1
+           for s, c in (a.get("subagent_invocations") or {}).items():
+               sub_totals[s] += c
+   if v3_rows == 0:
+       print("_no v3 sessions yet — schema bump captures this going forward_")
+   elif sub_totals:
+       rows = [(s, n) for s, n in sub_totals.most_common()]
+       print(table(["subagent", "invocations"], rows))
+       print(f"\n_aggregated over {v3_rows} v3 sessions_")
+   else:
+       print(f"_no Agent calls in {v3_rows} v3 sessions_")
+   print()
+
+   # Tool errors aggregated (v3+) — uses the captured field, no transcript reads
+   print("## Tool errors — top 10 sessions (v3+ rows)\n")
+   v3_with_errors = [a for a in auto if a.get("tool_errors_count") is not None and a.get("tool_errors_count") > 0]
+   v3_with_errors.sort(key=lambda x: x.get("tool_errors_count") or 0, reverse=True)
+   if v3_with_errors:
+       rows = []
+       for a in v3_with_errors[:10]:
+           cwd = (a.get("cwd") or "").split("/")[-1] or "-"
+           cost = a.get("cost_usd") or 0
+           rows.append((a["session_id"][:12], a.get("tool_errors_count"), f"${cost:.2f}", cwd))
+       print(table(["session_id", "errors", "cost", "project"], rows))
+       total_err = sum(a.get("tool_errors_count") or 0 for a in auto)
+       v3_count = sum(1 for a in auto if "tool_errors_count" in a)
+       print(f"\n_total: {total_err} tool errors across {v3_count} v3 sessions_")
+   elif any("tool_errors_count" in a for a in auto):
+       print("_no tool errors detected in v3 sessions_")
+   else:
+       print("_no v3 sessions yet_")
+   print()
+
+   # Correction-heavy sessions (v3+) — high-signal candidates for retro
+   print("## Correction-heavy sessions (v3+, by short_followups + correction_keywords)\n")
+   v3_corr = [a for a in auto
+              if "short_user_followups_count" in a
+              and ((a.get("short_user_followups_count") or 0) + (a.get("correction_keyword_hits") or 0)) > 0]
+   v3_corr.sort(
+       key=lambda x: (x.get("short_user_followups_count") or 0) + (x.get("correction_keyword_hits") or 0),
+       reverse=True,
+   )
+   if v3_corr:
+       rows = []
+       for a in v3_corr[:10]:
+           cwd = (a.get("cwd") or "").split("/")[-1] or "-"
+           cost = a.get("cost_usd") or 0
+           rows.append((
+               a["session_id"][:12],
+               a.get("short_user_followups_count") or 0,
+               a.get("correction_keyword_hits") or 0,
+               f"${cost:.2f}",
+               cwd,
+           ))
+       print(table(["session_id", "short_fups", "kw_hits", "cost", "project"], rows))
+   elif any("short_user_followups_count" in a for a in auto):
+       print("_no friction signals detected in v3 sessions_")
+   else:
+       print("_no v3 sessions yet_")
+   print()
+
+   # Cost trend by ISO week — measures impact of setup changes over time
+   print("## Cost trend by ISO week\n")
+   from datetime import datetime as _dt
+   by_week = defaultdict(lambda: [0.0, 0])  # [cost, sessions]
+   for a in auto:
+       ts = a.get("ts")
+       if not ts or a.get("cost_usd") is None:
+           continue
+       try:
+           dt = _dt.fromisoformat(ts.replace("Z", "+00:00"))
+       except Exception:
+           continue
+       y, w, _ = dt.isocalendar()
+       key = f"{y}-W{w:02d}"
+       by_week[key][0] += a["cost_usd"]
+       by_week[key][1] += 1
+   if by_week:
+       rows = [(k, n, f"${c:.2f}", f"${c/n:.2f}") for k, (c, n) in sorted(by_week.items())]
+       print(table(["week", "sessions", "total", "avg/session"], rows))
+   else:
+       print("_no dated sessions_")
    PY
    ```
 

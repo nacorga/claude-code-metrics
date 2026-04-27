@@ -2,7 +2,7 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "$id": "https://github.com/nacorga/claude-code-metrics/schema/auto.schema.json",
   "title": "Auto Metrics Row",
-  "description": "One row per Claude Code SessionEnd (real close only, not compact/clear). v2 dropped permission_mode (Claude Code does not send it in the SessionEnd payload).",
+  "description": "One row per Claude Code SessionEnd (real close only, not compact/clear). v3 adds five conversation-shape signals: tool_errors_count, subagent_invocations, user_msg_count, short_user_followups_count, correction_keyword_hits. v2 dropped permission_mode.",
   "type": "object",
   "required": [
     "schema_version",
@@ -18,10 +18,15 @@
     "cache_creation_tokens",
     "cache_read_tokens",
     "cost_usd",
-    "cwd"
+    "cwd",
+    "tool_errors_count",
+    "subagent_invocations",
+    "user_msg_count",
+    "short_user_followups_count",
+    "correction_keyword_hits"
   ],
   "properties": {
-    "schema_version": { "const": 2 },
+    "schema_version": { "const": 3 },
     "session_id": { "type": "string" },
     "ts": {
       "type": "string",
@@ -51,6 +56,31 @@
       "description": "Estimated cost. null if model is unknown and no _default fallback applied."
     },
     "cwd": { "type": "string" },
+    "tool_errors_count": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Number of tool_result blocks marked is_error=true. Indicates failing tools or retry loops."
+    },
+    "subagent_invocations": {
+      "type": "object",
+      "description": "Map of subagent_type → invocation count, captured from Agent tool_use input. Empty object if no Agent tool was used.",
+      "additionalProperties": { "type": "integer", "minimum": 0 }
+    },
+    "user_msg_count": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Number of user-authored text messages (excluding tool_result-only synthetic user entries)."
+    },
+    "short_user_followups_count": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "User messages (after the first) under 200 chars. High counts indicate the user steering with short corrections rather than full prompts."
+    },
+    "correction_keyword_hits": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Number of user messages matching correction-style keywords (undo, revert, rollback, redo, incorrect, wrong, broken, doesn't work, not what i asked/wanted). English-only conservative set; meant for retro pre-fill, not as a strict correction rate."
+    },
     "end_reason": {
       "type": "string",
       "enum": ["close"],

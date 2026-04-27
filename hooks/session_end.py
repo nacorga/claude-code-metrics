@@ -27,7 +27,36 @@ import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
+
+# Conversation-shape heuristics (v3).
+# Short follow-up threshold: any user text message under this many chars
+# (after the first) is counted as a "steering nudge". 200 picked from
+# observation: real prompts are usually longer; quick redirects are shorter.
+SHORT_FOLLOWUP_MAX_CHARS = 200
+
+# Correction keywords. Conservative English-only set: each phrase is a strong
+# signal that the user is undoing, redoing, or rejecting the assistant's last
+# action. Matched as case-insensitive substrings on the first 200 chars of
+# each user message — short corrections live at the top. Order does not
+# matter; we count distinct messages that hit at least once.
+#
+# Kept intentionally short and English-only to stay project-agnostic. Locale-
+# specific sets can be added downstream by analyzers; the hook only ships a
+# safe default.
+CORRECTION_KEYWORDS = (
+    "undo",
+    "revert",
+    "rollback",
+    "redo",
+    "incorrect",
+    "wrong",
+    "broken",
+    "doesn't work",
+    "doesnt work",
+    "not what i asked",
+    "not what i wanted",
+)
 
 # Transcript timestamps sometimes span days when a session is resumed after
 # a long idle period. Anything above this cap is almost certainly wall-clock,
@@ -95,6 +124,42 @@ def parse_iso(ts: str | None):
         return None
 
 
+def _user_text(content) -> str | None:
+    """Extract the user-authored text from a user-entry's content payload.
+
+    Claude Code transcripts represent user entries in two shapes:
+      - content: "free text"           → real user message
+      - content: [{type: text, text}…] → real user message (one or more text blocks)
+      - content: [{type: tool_result…}] → synthetic, NOT a user-authored message
+    We only treat the first two as "user messages".
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        has_text_block = False
+        for c in content:
+            if isinstance(c, dict) and c.get("type") == "text":
+                has_text_block = True
+                t = c.get("text")
+                if isinstance(t, str):
+                    parts.append(t)
+        if has_text_block:
+            return "\n".join(parts)
+    return None
+
+
+def _count_tool_errors(content) -> int:
+    """Count tool_result blocks marked is_error=true inside a user-entry's content."""
+    if not isinstance(content, list):
+        return 0
+    n = 0
+    for c in content:
+        if isinstance(c, dict) and c.get("type") == "tool_result" and c.get("is_error"):
+            n += 1
+    return n
+
+
 def parse_transcript(path: Path) -> dict:
     """Extract aggregates from the Claude Code transcript JSONL.
 
@@ -109,6 +174,11 @@ def parse_transcript(path: Path) -> dict:
     cache_creation = 0
     cache_read = 0
     tool_counts: dict[str, int] = {}
+    subagent_counts: dict[str, int] = {}
+    tool_errors_count = 0
+    user_msg_count = 0
+    short_user_followups_count = 0
+    correction_keyword_hits = 0
 
     with path.open("r") as f:
         for line in f:
@@ -127,7 +197,28 @@ def parse_transcript(path: Path) -> dict:
                 if last_ts is None or ts > last_ts:
                     last_ts = ts
 
-            if entry.get("type") != "assistant":
+            etype = entry.get("type")
+
+            if etype == "user":
+                msg = entry.get("message") or {}
+                content = msg.get("content")
+                # Count tool errors from synthetic user entries (tool_result blocks)
+                tool_errors_count += _count_tool_errors(content)
+                # Real user messages
+                text = _user_text(content)
+                if text is not None:
+                    user_msg_count += 1
+                    stripped = text.strip()
+                    # Skip system-injected prompts (caveats, hooks) for follow-up signal.
+                    is_system_injected = stripped.startswith("<") or stripped.startswith("Caveat:")
+                    if user_msg_count > 1 and not is_system_injected and 0 < len(stripped) < SHORT_FOLLOWUP_MAX_CHARS:
+                        short_user_followups_count += 1
+                    head = stripped[:200].lower()
+                    if any(kw in head for kw in CORRECTION_KEYWORDS):
+                        correction_keyword_hits += 1
+                continue
+
+            if etype != "assistant":
                 continue
 
             turn_count += 1
@@ -147,6 +238,14 @@ def parse_transcript(path: Path) -> dict:
                 if isinstance(block, dict) and block.get("type") == "tool_use":
                     name = block.get("name") or "<unknown>"
                     tool_counts[name] = tool_counts.get(name, 0) + 1
+                    # Capture subagent dispatches separately so we can answer
+                    # "how often is Explore actually used?" without re-parsing
+                    # transcripts. Falls back to "<unknown>" when input is malformed.
+                    if name == "Agent":
+                        inp = block.get("input") or {}
+                        sub = inp.get("subagent_type") if isinstance(inp, dict) else None
+                        sub = sub or "<unknown>"
+                        subagent_counts[sub] = subagent_counts.get(sub, 0) + 1
 
     # Transcript existed but no assistant ever responded (session abandoned,
     # /clear before first turn, hook fired mid-flush). Mark as error so
@@ -171,6 +270,11 @@ def parse_transcript(path: Path) -> dict:
         "cache_read_tokens": cache_read,
         "tool_distribution": tool_counts,
         "tool_calls_total": sum(tool_counts.values()),
+        "tool_errors_count": tool_errors_count,
+        "subagent_invocations": subagent_counts,
+        "user_msg_count": user_msg_count,
+        "short_user_followups_count": short_user_followups_count,
+        "correction_keyword_hits": correction_keyword_hits,
     }
 
 
@@ -286,6 +390,11 @@ def run_worker(payload: dict) -> None:
         "cache_creation_tokens": parsed["cache_creation_tokens"],
         "cache_read_tokens": parsed["cache_read_tokens"],
         "cost_usd": cost,
+        "tool_errors_count": parsed["tool_errors_count"],
+        "subagent_invocations": parsed["subagent_invocations"],
+        "user_msg_count": parsed["user_msg_count"],
+        "short_user_followups_count": parsed["short_user_followups_count"],
+        "correction_keyword_hits": parsed["correction_keyword_hits"],
     })
 
     model = parsed.get("model")
@@ -384,6 +493,11 @@ def _empty_metrics() -> dict:
         "cache_creation_tokens": 0,
         "cache_read_tokens": 0,
         "cost_usd": None,
+        "tool_errors_count": 0,
+        "subagent_invocations": {},
+        "user_msg_count": 0,
+        "short_user_followups_count": 0,
+        "correction_keyword_hits": 0,
     }
 
 

@@ -1,8 +1,14 @@
 {
-  "_comment": "USD per 1M tokens. Estimates only — not billed cost. Verify at https://claude.com/pricing before trusting. Model IDs are matched by prefix (longest-first), fallback is _default. Cache rates follow the standard pattern (cache_write = 1.25 × input, cache_read = 0.10 × input).",
-  "_version": 3,
-  "_source": "https://platform.claude.com/docs/en/about-claude/models/overview (verified 2026-04-15)",
+  "_comment": "USD per 1M tokens. Estimates only — not billed cost. Verify at https://claude.com/pricing before trusting. Model IDs are matched by prefix (longest-first), fallback is _default. Cache rates generally follow the standard pattern (cache_write = 1.25 × input, cache_read = 0.10 × input), but some legacy models (e.g. Claude Haiku 3) have explicit rates that do not match the formula — official published values are used here.",
+  "_version": 5,
+  "_source": "https://claude.com/pricing (verified 2026-04-27)",
 
+  "claude-opus-4-7": {
+    "input": 5.0,
+    "output": 25.0,
+    "cache_write": 6.25,
+    "cache_read": 0.5
+  },
   "claude-opus-4-6": {
     "input": 5.0,
     "output": 25.0,
@@ -58,6 +64,12 @@
     "cache_write": 3.75,
     "cache_read": 0.3
   },
+  "claude-3-7-sonnet": {
+    "input": 3.0,
+    "output": 15.0,
+    "cache_write": 3.75,
+    "cache_read": 0.3
+  },
 
   "claude-haiku-4-5": {
     "input": 1.0,
@@ -65,11 +77,24 @@
     "cache_write": 1.25,
     "cache_read": 0.1
   },
+  "claude-3-5-haiku": {
+    "input": 0.80,
+    "output": 4.0,
+    "cache_write": 1.0,
+    "cache_read": 0.08
+  },
   "claude-3-haiku": {
     "input": 0.25,
     "output": 1.25,
-    "cache_write": 0.3125,
-    "cache_read": 0.025
+    "cache_write": 0.30,
+    "cache_read": 0.03
+  },
+
+  "claude-3-opus": {
+    "input": 15.0,
+    "output": 75.0,
+    "cache_write": 18.75,
+    "cache_read": 1.5
   },
 
   "_default": {
