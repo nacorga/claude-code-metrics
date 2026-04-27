@@ -31,6 +31,7 @@ Guidance for Claude Code (and contributors) working in this repo. See [README.md
 - **Cross-platform in hook + tests.** `fcntl` restricts us to Unix (macOS + Linux). Windows is explicitly out of scope for v0.x. Never add code that silently breaks on macOS (e.g. GNU-only `date` flags).
 - **Installer patches settings.json via Python's `json` module.** Never regex-replace JSON. Always preserve other hooks and unrelated keys.
 - **Preserve user data on uninstall by default.** Only `--purge-data` may delete `~/.claude/metrics/` contents.
+- **No fabricated metrics.** The Claude Code transcript records `usage` only for the main agent; tokens consumed *inside* a subagent's own context window are not exposed. We measure subagent cost indirectly via the **return surface** (`return_chars_total`, `duration_s_total`, `errors`) — never by inventing per-subagent token figures.
 
 ## Workflow
 
@@ -44,6 +45,7 @@ Guidance for Claude Code (and contributors) working in this repo. See [README.md
 | v1      | Initial.                                                                                                |
 | v2      | Dropped `permission_mode` (Claude Code does not send it in SessionEnd payload).                         |
 | v3      | Added five conversation-shape signals: `tool_errors_count`, `subagent_invocations`, `user_msg_count`, `short_user_followups_count`, `correction_keyword_hits`. Old v1/v2 rows coexist; `/analyze-metrics` uses `field in row` guards to gracefully skip them in v3-only sections. |
+| v4      | Added per-subagent return-surface aggregates: `subagent_stats` (count / return_chars_total / duration_s_total / errors / maxes per `subagent_type`) and `cheap_subagent_calls` (dispatches with <200-char `tool_result`). `subagent_invocations` kept additive for back-compat. v3 rows coexist; the skill guards on `"subagent_stats" in row`. |
 - **Adding a model to pricing:** add a prefix entry in `config/pricing.json`. Prefix matcher picks longest-first, so more specific SKUs can be added without reordering.
 
 ## Scope rules

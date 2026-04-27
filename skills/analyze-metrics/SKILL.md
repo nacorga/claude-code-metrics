@@ -262,6 +262,110 @@ Summarise the local metrics JSONL files. Read-only — writes nothing to disk.
        print(f"_no Agent calls in {v3_rows} v3 sessions_")
    print()
 
+   # Subagent return surface (v4+) — what each subagent type dumps back into the main context.
+   # Tokens cannot be attributed per subagent (transcript records only main-agent usage),
+   # so we measure the return surface: chars, duration, errors. This is what actually
+   # bloats the parent's context window and drives cost/latency.
+   print("## Subagent return surface (v4+ rows only)\n")
+   surface = defaultdict(lambda: {
+       "count": 0, "return_chars": 0, "duration_s": 0.0,
+       "errors": 0, "max_chars": 0, "max_dur": 0.0,
+   })
+   v4_rows = 0
+   for a in auto:
+       if "subagent_stats" not in a:
+           continue
+       v4_rows += 1
+       for sub, stat in (a.get("subagent_stats") or {}).items():
+           s = surface[sub]
+           s["count"] += stat.get("count") or 0
+           s["return_chars"] += stat.get("return_chars_total") or 0
+           s["duration_s"] += stat.get("duration_s_total") or 0.0
+           s["errors"] += stat.get("errors") or 0
+           if (stat.get("max_return_chars") or 0) > s["max_chars"]:
+               s["max_chars"] = stat.get("max_return_chars") or 0
+           if (stat.get("max_duration_s") or 0) > s["max_dur"]:
+               s["max_dur"] = stat.get("max_duration_s") or 0
+   if v4_rows == 0:
+       print("_no v4 sessions yet — schema bump captures this going forward_")
+   elif surface:
+       total_chars = sum(s["return_chars"] for s in surface.values()) or 1
+       rows = []
+       for sub, s in sorted(surface.items(), key=lambda kv: kv[1]["return_chars"], reverse=True):
+           avg_chars = s["return_chars"] // s["count"] if s["count"] else 0
+           pct = s["return_chars"] / total_chars * 100
+           rows.append((
+               sub,
+               s["count"],
+               f"{s['return_chars']:,}",
+               f"{avg_chars:,}",
+               f"{s['duration_s']:.1f}",
+               s["errors"],
+               f"{pct:.1f}%",
+           ))
+       print(table(["subagent", "calls", "chars total", "avg chars", "dur s", "errors", "% of return"], rows))
+       print(f"\n_aggregated over {v4_rows} v4 sessions_")
+   else:
+       print(f"_no Agent calls in {v4_rows} v4 sessions_")
+   print()
+
+   # Slowest subagents (v4+) — by total wall-clock and by single-call max.
+   print("## Slowest subagent types (v4+ rows only)\n")
+   if v4_rows == 0:
+       print("_no v4 sessions yet_")
+   elif surface:
+       rows = []
+       for sub, s in sorted(surface.items(), key=lambda kv: kv[1]["duration_s"], reverse=True)[:5]:
+           avg_dur = s["duration_s"] / s["count"] if s["count"] else 0
+           rows.append((
+               sub,
+               s["count"],
+               f"{s['duration_s']:.1f}",
+               f"{avg_dur:.1f}",
+               f"{s['max_dur']:.1f}",
+           ))
+       print(table(["subagent", "calls", "total s", "avg s", "max s"], rows))
+   else:
+       print("_no subagent activity in v4 sessions_")
+   print()
+
+   # Cheap subagent calls (v4+) — dispatches whose tool_result was <200 chars.
+   # High counts suggest the subagent overhead was wasted; a direct grep/Read
+   # would have produced the same answer cheaper and faster.
+   print("## Cheap subagent calls (v4+ rows only)\n")
+   v4_with_field = [a for a in auto if "cheap_subagent_calls" in a]
+   if not v4_with_field:
+       print("_no v4 sessions yet_")
+   else:
+       cheap_total = sum(a.get("cheap_subagent_calls") or 0 for a in v4_with_field)
+       sub_total = sum(
+           sum((a.get("subagent_stats") or {}).get(s, {}).get("count") or 0
+               for s in (a.get("subagent_stats") or {}))
+           for a in v4_with_field
+       )
+       if sub_total == 0:
+           print(f"_no Agent calls across {len(v4_with_field)} v4 sessions_")
+       else:
+           pct = cheap_total / sub_total * 100
+           print(f"**{cheap_total} of {sub_total} subagent dispatches ({pct:.1f}%) returned <200 chars** — likely solvable with a direct grep/Read.\n")
+           offenders = sorted(
+               (a for a in v4_with_field if (a.get("cheap_subagent_calls") or 0) > 0),
+               key=lambda x: x.get("cheap_subagent_calls") or 0, reverse=True,
+           )[:5]
+           if offenders:
+               rows = []
+               for a in offenders:
+                   cwd = (a.get("cwd") or "").split("/")[-1] or "-"
+                   cost = a.get("cost_usd") or 0
+                   rows.append((
+                       a["session_id"][:12],
+                       a.get("cheap_subagent_calls") or 0,
+                       f"${cost:.2f}",
+                       cwd,
+                   ))
+               print(table(["session_id", "cheap calls", "cost", "project"], rows))
+   print()
+
    # Tool errors aggregated (v3+) — uses the captured field, no transcript reads
    print("## Tool errors — top 10 sessions (v3+ rows)\n")
    v3_with_errors = [a for a in auto if a.get("tool_errors_count") is not None and a.get("tool_errors_count") > 0]

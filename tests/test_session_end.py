@@ -110,7 +110,7 @@ class TestSessionEndHook(unittest.TestCase):
         rows = read_jsonl(self.auto_path)
         self.assertEqual(len(rows), 1)
         row = rows[0]
-        self.assertEqual(row["schema_version"], 3)
+        self.assertEqual(row["schema_version"], 4)
         self.assertEqual(row["session_id"], "s-happy")
         self.assertEqual(row["model"], "claude-sonnet-4-5")
         self.assertEqual(row["turn_count"], 2)
