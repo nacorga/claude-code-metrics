@@ -93,12 +93,19 @@ class TestSubagentStats(unittest.TestCase):
     def _run(self, entries: list[dict], session_id: str = "s") -> dict:
         transcript = self.home / f"{session_id}.jsonl"
         write_transcript(transcript, entries)
-        run_hook({
+        result = run_hook({
             "hook_event_name": "SessionEnd",
             "session_id": session_id,
             "transcript_path": str(transcript),
             "cwd": "/x",
         }, self.home)
+        # Surface real failures (crash, timeout, bad payload) instead of
+        # letting them masquerade as a confusing "missing row" assertion.
+        self.assertEqual(
+            result.returncode, 0,
+            f"hook exited {result.returncode} for {session_id}\n"
+            f"stderr:\n{result.stderr}\nstdout:\n{result.stdout}",
+        )
         rows = [r for r in read_jsonl(self.auto_path) if r["session_id"] == session_id]
         self.assertEqual(len(rows), 1, f"expected exactly one row for {session_id}")
         return rows[0]

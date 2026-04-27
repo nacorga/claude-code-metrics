@@ -59,7 +59,8 @@ Summarise the local metrics JSONL files. Read-only — writes nothing to disk.
 
    auto = list(auto_all)
    if cutoff is not None:
-       auto = [a for a in auto if (_row_ts(a) is not None and _row_ts(a) >= cutoff)]
+       # Walrus avoids re-parsing the ISO timestamp twice per row.
+       auto = [a for a in auto if (ts := _row_ts(a)) is not None and ts >= cutoff]
    if proj_raw:
        auto = [a for a in auto if _project_matches(a, proj_raw)]
 

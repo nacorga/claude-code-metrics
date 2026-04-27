@@ -755,17 +755,31 @@ class TestCaptureGitMetadata(unittest.TestCase):
         ])
         return transcript
 
+    def _run_and_get_row(self, session_id: str, cwd: Path | str) -> dict:
+        """Drive the hook with a minimal transcript, assert clean exit, and
+        return the single auto.jsonl row for `session_id`. Surfacing
+        returncode/stderr keeps failures actionable instead of bubbling up
+        as a confusing IndexError on read_jsonl(...)[0]."""
+        transcript = self._write_minimal_transcript()
+        result = run_hook({
+            "hook_event_name": "SessionEnd",
+            "session_id": session_id,
+            "transcript_path": str(transcript),
+            "cwd": str(cwd),
+        }, self.home)
+        self.assertEqual(
+            result.returncode, 0,
+            f"hook exited {result.returncode} for {session_id}\n"
+            f"stderr:\n{result.stderr}\nstdout:\n{result.stdout}",
+        )
+        rows = [r for r in read_jsonl(self.auto_path) if r["session_id"] == session_id]
+        self.assertEqual(len(rows), 1, f"expected exactly one row for {session_id}")
+        return rows[0]
+
     def test_repo_with_remote_captures_normalized_origin(self):
         self._git("init", "-q")
         self._git("remote", "add", "origin", "git@github.com:foo/bar.git")
-        transcript = self._write_minimal_transcript()
-        run_hook({
-            "hook_event_name": "SessionEnd",
-            "session_id": "s-git-ssh",
-            "transcript_path": str(transcript),
-            "cwd": str(self.repo_dir),
-        }, self.home)
-        row = read_jsonl(self.auto_path)[0]
+        row = self._run_and_get_row("s-git-ssh", self.repo_dir)
         # git_root may be the repo dir or its realpath (macOS /private/var
         # symlink). Compare via resolve() to absorb that.
         self.assertEqual(Path(row["git_root"]).resolve(), self.repo_dir.resolve())
@@ -773,40 +787,19 @@ class TestCaptureGitMetadata(unittest.TestCase):
 
     def test_repo_without_remote_captures_root_only(self):
         self._git("init", "-q")
-        transcript = self._write_minimal_transcript()
-        run_hook({
-            "hook_event_name": "SessionEnd",
-            "session_id": "s-git-noremote",
-            "transcript_path": str(transcript),
-            "cwd": str(self.repo_dir),
-        }, self.home)
-        row = read_jsonl(self.auto_path)[0]
+        row = self._run_and_get_row("s-git-noremote", self.repo_dir)
         self.assertEqual(Path(row["git_root"]).resolve(), self.repo_dir.resolve())
         self.assertEqual(row["git_remote_origin"], "")
 
     def test_outside_repo_yields_empty_strings(self):
         # Plain dir, never `git init`-ed. Both fields must be empty strings —
         # not null, not missing — so the row stays schema-valid.
-        transcript = self._write_minimal_transcript()
-        run_hook({
-            "hook_event_name": "SessionEnd",
-            "session_id": "s-no-git",
-            "transcript_path": str(transcript),
-            "cwd": str(self.repo_dir),
-        }, self.home)
-        row = read_jsonl(self.auto_path)[0]
+        row = self._run_and_get_row("s-no-git", self.repo_dir)
         self.assertEqual(row["git_root"], "")
         self.assertEqual(row["git_remote_origin"], "")
 
     def test_nonexistent_cwd_yields_empty_strings(self):
-        transcript = self._write_minimal_transcript()
-        run_hook({
-            "hook_event_name": "SessionEnd",
-            "session_id": "s-bad-cwd",
-            "transcript_path": str(transcript),
-            "cwd": "/this/does/not/exist",
-        }, self.home)
-        row = read_jsonl(self.auto_path)[0]
+        row = self._run_and_get_row("s-bad-cwd", "/this/does/not/exist")
         self.assertEqual(row["git_root"], "")
         self.assertEqual(row["git_remote_origin"], "")
 
@@ -814,14 +807,7 @@ class TestCaptureGitMetadata(unittest.TestCase):
         self._git("init", "-q")
         self._git("remote", "add", "origin",
                   "https://github.com/foo/bar.git")
-        transcript = self._write_minimal_transcript()
-        run_hook({
-            "hook_event_name": "SessionEnd",
-            "session_id": "s-git-https",
-            "transcript_path": str(transcript),
-            "cwd": str(self.repo_dir),
-        }, self.home)
-        row = read_jsonl(self.auto_path)[0]
+        row = self._run_and_get_row("s-git-https", self.repo_dir)
         self.assertEqual(row["git_remote_origin"], "github.com/foo/bar")
 
 

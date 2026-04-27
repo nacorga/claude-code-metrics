@@ -136,9 +136,10 @@ def _capture_git_metadata(cwd: str) -> tuple[str, str]:
     inside a git repo, no origin is configured, or git is unavailable.
 
     Runs only inside the detached worker (post double-fork), so the 2s
-    timeout cannot stall Claude Code's session close. Common failure modes
-    (cwd outside a repo, missing remote) are silent — only unexpected
-    exceptions log to hook.log.
+    timeout cannot stall Claude Code's session close. Expected failures —
+    git binary missing (FileNotFoundError), cwd outside a repo, missing
+    remote — are silent. Only timeouts and genuine OS errors log, since
+    those signal something worth investigating.
     """
     if not cwd:
         return "", ""
@@ -152,7 +153,9 @@ def _capture_git_metadata(cwd: str) -> tuple[str, str]:
             ["git", "-C", cwd, "rev-parse", "--show-toplevel"],
             capture_output=True, text=True, timeout=2,
         )
-    except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as e:
+    except FileNotFoundError:
+        return "", ""
+    except (subprocess.TimeoutExpired, OSError) as e:
         log(f"git rev-parse failed at {cwd}: {e}")
         return "", ""
     if proc.returncode != 0:
@@ -165,7 +168,9 @@ def _capture_git_metadata(cwd: str) -> tuple[str, str]:
             ["git", "-C", git_root, "config", "--get", "remote.origin.url"],
             capture_output=True, text=True, timeout=2,
         )
-    except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as e:
+    except FileNotFoundError:
+        return git_root, ""
+    except (subprocess.TimeoutExpired, OSError) as e:
         log(f"git config failed at {git_root}: {e}")
         return git_root, ""
     if proc2.returncode != 0:
