@@ -6,7 +6,7 @@ disable-model-invocation: true
 
 # /metrics-report
 
-Generate a single static HTML file with the same insights as `/analyze-metrics`, jerarquized for at-a-glance reading: hero KPIs, weekly cost chart (inline SVG), tables with proportional bars, callouts for the high-signal findings (cache savings, marathon spend share, cheap subagent calls). Zero JavaScript, zero CDN, zero network calls — opens directly via `file://`.
+Generate a single static HTML file with the same insights as `/analyze-metrics`, organized for at-a-glance reading: hero KPIs, weekly cost chart (inline SVG), tables with proportional bars, callouts for the high-signal findings (cache savings, marathon spend share, cheap subagent calls). Zero JavaScript, zero CDN, zero network calls — opens directly via `file://`.
 
 ## Arguments
 
