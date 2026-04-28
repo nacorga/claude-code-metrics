@@ -21,6 +21,7 @@ Guidance for Claude Code (and contributors) working in this repo. See [README.md
 | `skills/retrospective/SKILL.md`       | Manual `/retrospective` — captures subjective metrics           |
 | `skills/analyze-metrics/SKILL.md`     | Manual `/analyze-metrics` — markdown report from local JSONL    |
 | `skills/analyze-metrics/_helpers.py`  | Shared filter / project-identity helpers (also used by `/metrics-report`) |
+| `skills/analyze-metrics/_aggregate.py`| Shared aggregation logic — single source of truth for every cut both reports show. Imported by `/analyze-metrics` and `/metrics-report` to keep the markdown and HTML formats in lockstep. |
 | `skills/metrics-report/SKILL.md`      | Manual `/metrics-report` — invokes `_render.py`                 |
 | `skills/metrics-report/_render.py`    | Static HTML report generator. Stdlib-only, no JS, no CDN        |
 | `scripts/install.sh` / `uninstall.sh` | Idempotent; patch `~/.claude/settings.json` via Python (json)   |

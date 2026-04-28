@@ -30,8 +30,8 @@ def _claude_home() -> Path:
     return Path(os.environ.get("CLAUDE_HOME") or (Path.home() / ".claude"))
 
 
-def _load_helpers():
-    """Locate analyze-metrics/_helpers.py and import it.
+def _resolve_skill_dir(filename: str) -> Path:
+    """Find the analyze-metrics skill directory containing `filename`.
 
     Resolution order:
       1. CCM_HELPERS_DIR env var (used by tests).
@@ -39,7 +39,7 @@ def _load_helpers():
       3. Installed skill at $CLAUDE_HOME/skills/analyze-metrics.
 
     Fails loudly with a clear message rather than silently degrading — the
-    filter and project-key rules are load-bearing for correct aggregates.
+    filter and aggregation rules are load-bearing for correct numbers.
     """
     candidates = []
     env_dir = os.environ.get("CCM_HELPERS_DIR")
@@ -48,23 +48,35 @@ def _load_helpers():
     here = Path(__file__).resolve().parent
     candidates.append(here.parent / "analyze-metrics")
     candidates.append(_claude_home() / "skills" / "analyze-metrics")
-
     for cand in candidates:
-        if (cand / "_helpers.py").is_file():
-            sys.path.insert(0, str(cand))
-            import _helpers  # type: ignore
-            return _helpers
-
+        if (cand / filename).is_file():
+            return cand
     raise SystemExit(
-        "metrics-report: could not locate analyze-metrics/_helpers.py.\n"
+        f"metrics-report: could not locate analyze-metrics/{filename}.\n"
         "Tried: " + ", ".join(str(c) for c in candidates) + "\n"
         "Reinstall with scripts/install.sh, or set CCM_HELPERS_DIR."
     )
 
 
+def _load_helpers():
+    d = _resolve_skill_dir("_helpers.py")
+    sys.path.insert(0, str(d))
+    import _helpers  # type: ignore
+    return _helpers
+
+
+def _load_aggregate():
+    # _aggregate imports from _helpers, so put its dir on sys.path first.
+    d = _resolve_skill_dir("_aggregate.py")
+    sys.path.insert(0, str(d))
+    import _aggregate  # type: ignore
+    return _aggregate
+
+
 # Lazy-loaded on first call to main(), so importing this module for tests
 # without the helpers in place still works.
 _h: Any = None
+_agg: Any = None
 
 
 # ----------------------------------------------------------------------
@@ -255,247 +267,6 @@ def _load_pricing(metrics_dir: Path) -> dict:
         return json.loads(p.read_text())
     except (json.JSONDecodeError, OSError):
         return {}
-
-
-def _rates_for(model_id: str, pricing: dict) -> tuple[float, float] | None:
-    if not model_id or not pricing:
-        return None
-    keys = [k for k in pricing if not k.startswith("_") and model_id.startswith(k)]
-    keys.sort(key=len, reverse=True)
-    entry = pricing.get(keys[0]) if keys else pricing.get("_default")
-    if not entry:
-        return None
-    rate_in = entry.get("input")
-    rate_cr = entry.get("cache_read")
-    if rate_in is None or rate_cr is None:
-        return None
-    return float(rate_in), float(rate_cr)
-
-
-# ----------------------------------------------------------------------
-# Aggregation — mirrors /analyze-metrics so numbers match between formats
-# ----------------------------------------------------------------------
-
-def _disambiguated_label_factory(by_proj_key: dict) -> Any:
-    """Build a labeler that disambiguates colliding human labels with a
-    short suffix, same rule as /analyze-metrics."""
-    label_keys: dict[str, list[str]] = defaultdict(list)
-    for k in by_proj_key:
-        label_keys[_h._project_label(k)].append(k)
-
-    def label(k: str) -> str:
-        base = _h._project_label(k)
-        if len(label_keys[base]) <= 1:
-            return base
-        suffix = k[-8:] if len(k) > 8 else k
-        return f"{base} ({suffix})"
-
-    return label
-
-
-def aggregate(auto: list[dict], retro_by_id: dict[str, dict],
-              pricing: dict) -> dict:
-    """Produce all the cuts the report renders. Pure: no I/O."""
-    joined = [{**a, **retro_by_id.get(a.get("session_id", ""), {})}
-              for a in auto]
-
-    costs = [a["cost_usd"] for a in auto if a.get("cost_usd") is not None]
-
-    # Cost by model
-    by_model: dict[str, list[float]] = defaultdict(list)
-    for a in auto:
-        if a.get("cost_usd") is not None:
-            by_model[a.get("model") or "unknown"].append(a["cost_usd"])
-
-    # Cost by project
-    by_proj_key: dict[str, list[float]] = defaultdict(list)
-    for a in auto:
-        if a.get("cost_usd") is not None:
-            by_proj_key[_h._project_key(a)].append(a["cost_usd"])
-
-    # Cost by task_outcome (retro)
-    by_outcome: dict[str, list[float]] = defaultdict(list)
-    for j in joined:
-        if j.get("task_outcome") and j.get("cost_usd") is not None:
-            by_outcome[j["task_outcome"]].append(j["cost_usd"])
-
-    # Correction rate by model (retro)
-    by_model_corr: dict[str, list[float]] = defaultdict(list)
-    for j in joined:
-        if j.get("correction_rate") is not None and j.get("model"):
-            by_model_corr[j["model"]].append(j["correction_rate"])
-
-    # Skill trigger accuracy (retro)
-    tri = Counter(j.get("skill_trigger_accuracy") for j in joined
-                  if j.get("skill_trigger_accuracy"))
-
-    # Top expensive
-    top_expensive = sorted(
-        (a for a in auto if a.get("cost_usd") is not None),
-        key=lambda x: x["cost_usd"], reverse=True,
-    )[:10]
-
-    # Cache efficiency
-    cache_by_model: dict[str, list[int]] = defaultdict(lambda: [0, 0])
-    for a in auto:
-        m_ = a.get("model") or "unknown"
-        cache_by_model[m_][0] += a.get("cache_read_tokens") or 0
-        cache_by_model[m_][1] += a.get("cache_creation_tokens") or 0
-
-    # Cache savings counterfactual
-    savings_by_model: dict[str, list[float]] = defaultdict(lambda: [0.0, 0])
-    total_actual = 0.0
-    total_counterfactual = 0.0
-    for a in auto:
-        cr = a.get("cache_read_tokens") or 0
-        if cr <= 0:
-            continue
-        rates = _rates_for(a.get("model") or "", pricing)
-        if not rates:
-            continue
-        rate_in, rate_cr = rates
-        saved = cr * (rate_in - rate_cr) / 1_000_000
-        m_ = a.get("model") or "unknown"
-        savings_by_model[m_][0] += saved
-        savings_by_model[m_][1] += cr
-        if a.get("cost_usd") is not None:
-            total_actual += a["cost_usd"]
-            total_counterfactual += a["cost_usd"] + saved
-    total_saved = sum(s for s, _ in savings_by_model.values())
-
-    # Marathon sessions
-    all_marathons = [a for a in auto if (a.get("turn_count") or 0) > 300]
-    marathons = sorted(
-        all_marathons, key=lambda x: x.get("cost_usd") or 0, reverse=True,
-    )[:10]
-    marathon_total_count = len(all_marathons)
-    marathon_total_cost = sum(a.get("cost_usd") or 0 for a in all_marathons)
-
-    # Top tools
-    tool_totals: Counter = Counter()
-    for a in auto:
-        for t, c in (a.get("tool_distribution") or {}).items():
-            tool_totals[t] += c
-
-    # Subagent invocations (v3+)
-    sub_totals: Counter = Counter()
-    v3_sub_rows = 0
-    for a in auto:
-        if "subagent_invocations" in a:
-            v3_sub_rows += 1
-            for s, c in (a.get("subagent_invocations") or {}).items():
-                sub_totals[s] += c
-
-    # Subagent return surface (v4+)
-    surface: dict[str, dict] = defaultdict(lambda: {
-        "count": 0, "return_chars": 0, "duration_s": 0.0,
-        "errors": 0, "max_chars": 0, "max_dur": 0.0,
-    })
-    v4_rows = 0
-    for a in auto:
-        if "subagent_stats" not in a:
-            continue
-        v4_rows += 1
-        for sub, stat in (a.get("subagent_stats") or {}).items():
-            s = surface[sub]
-            s["count"] += stat.get("count") or 0
-            s["return_chars"] += stat.get("return_chars_total") or 0
-            s["duration_s"] += stat.get("duration_s_total") or 0.0
-            s["errors"] += stat.get("errors") or 0
-            if (stat.get("max_return_chars") or 0) > s["max_chars"]:
-                s["max_chars"] = stat.get("max_return_chars") or 0
-            if (stat.get("max_duration_s") or 0) > s["max_dur"]:
-                s["max_dur"] = stat.get("max_duration_s") or 0
-
-    # Cheap subagent calls (v4+)
-    cheap_rows = [a for a in auto if "cheap_subagent_calls" in a]
-    cheap_total = sum(a.get("cheap_subagent_calls") or 0 for a in cheap_rows)
-    sub_total_dispatches = sum(
-        sum((a.get("subagent_stats") or {}).get(s, {}).get("count") or 0
-            for s in (a.get("subagent_stats") or {}))
-        for a in cheap_rows
-    )
-    cheap_offenders = sorted(
-        (a for a in cheap_rows if (a.get("cheap_subagent_calls") or 0) > 0),
-        key=lambda x: x.get("cheap_subagent_calls") or 0, reverse=True,
-    )[:5]
-
-    # Tool errors (v3+)
-    v3_with_errors = sorted(
-        (a for a in auto
-         if a.get("tool_errors_count") is not None
-         and a.get("tool_errors_count") > 0),
-        key=lambda x: x.get("tool_errors_count") or 0, reverse=True,
-    )
-    total_errors = sum(a.get("tool_errors_count") or 0 for a in auto
-                       if "tool_errors_count" in a)
-    v3_err_count = sum(1 for a in auto if "tool_errors_count" in a)
-
-    # Correction-heavy (v3+)
-    v3_corr = [
-        a for a in auto
-        if "short_user_followups_count" in a
-        and ((a.get("short_user_followups_count") or 0)
-             + (a.get("correction_keyword_hits") or 0)) > 0
-    ]
-    v3_corr.sort(
-        key=lambda x: ((x.get("short_user_followups_count") or 0)
-                       + (x.get("correction_keyword_hits") or 0)),
-        reverse=True,
-    )
-
-    # Cost trend by ISO week
-    by_week: dict[str, list[float]] = defaultdict(lambda: [0.0, 0])
-    for a in auto:
-        ts = a.get("ts")
-        if not ts or a.get("cost_usd") is None:
-            continue
-        try:
-            dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-        except (ValueError, TypeError):
-            continue
-        y, w, _ = dt.isocalendar()
-        key = f"{y}-W{w:02d}"
-        by_week[key][0] += a["cost_usd"]
-        by_week[key][1] += 1
-
-    schema_versions = sorted({
-        a.get("schema_version") for a in auto if a.get("schema_version") is not None
-    })
-
-    return {
-        "joined": joined,
-        "costs": costs,
-        "by_model": dict(by_model),
-        "by_proj_key": dict(by_proj_key),
-        "by_outcome": dict(by_outcome),
-        "by_model_corr": dict(by_model_corr),
-        "trigger_accuracy": dict(tri),
-        "top_expensive": top_expensive,
-        "cache_by_model": {k: list(v) for k, v in cache_by_model.items()},
-        "savings_by_model": {k: list(v) for k, v in savings_by_model.items()},
-        "total_saved": total_saved,
-        "total_actual": total_actual,
-        "total_counterfactual": total_counterfactual,
-        "marathons": marathons,
-        "marathon_total_count": marathon_total_count,
-        "marathon_total_cost": marathon_total_cost,
-        "tool_totals": dict(tool_totals),
-        "sub_totals": dict(sub_totals),
-        "v3_sub_rows": v3_sub_rows,
-        "surface": {k: dict(v) for k, v in surface.items()},
-        "v4_rows": v4_rows,
-        "cheap_total": cheap_total,
-        "cheap_dispatches": sub_total_dispatches,
-        "cheap_rows": len(cheap_rows),
-        "cheap_offenders": cheap_offenders,
-        "tool_errors": v3_with_errors[:10],
-        "total_errors": total_errors,
-        "v3_err_count": v3_err_count,
-        "correction_heavy": v3_corr[:10],
-        "by_week": dict(by_week),
-        "schema_versions": schema_versions,
-    }
 
 
 # ----------------------------------------------------------------------
@@ -1128,7 +899,7 @@ def _render_by_model(by_model: dict[str, list[float]]) -> str:
 def _render_by_project(by_proj_key: dict[str, list[float]]) -> str:
     if not by_proj_key:
         return _section("by-project", "Cost by project", _empty("no cost data"))
-    label = _disambiguated_label_factory(by_proj_key)
+    label = _agg._disambiguated_label_factory(by_proj_key)
     max_total = max(sum(v) for v in by_proj_key.values()) or 1.0
     rows = []
     for k, v in sorted(by_proj_key.items(), key=lambda kv: sum(kv[1]), reverse=True):
@@ -1602,9 +1373,9 @@ def render_html(auto: list[dict], retro: list[dict], pricing: dict,
     retro_by_id = {r["session_id"]: r for r in retro
                    if isinstance(r, dict) and r.get("session_id")}
     if auto:
-        agg = aggregate(auto, retro_by_id, pricing)
+        agg = _agg.aggregate(auto, retro_by_id, pricing)
     else:
-        agg = aggregate([], {}, pricing)
+        agg = _agg.aggregate([], {}, pricing)
 
     body_parts = [
         _render_hero(meta, agg, all_time),
@@ -1695,8 +1466,9 @@ def _build_meta(args, n_sessions: int, err_count: int,
 
 
 def main(argv: list[str] | None = None) -> int:
-    global _h
+    global _h, _agg
     _h = _load_helpers()
+    _agg = _load_aggregate()
 
     parser = argparse.ArgumentParser(
         prog="metrics-report",
