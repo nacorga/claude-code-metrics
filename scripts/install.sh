@@ -21,7 +21,8 @@ printf '  ✓ hook installed → %s\n' "$HOOKS_DIR/session_end.py"
 
 cp -R "$REPO_DIR/skills/retrospective"   "$SKILLS_DIR/"
 cp -R "$REPO_DIR/skills/analyze-metrics" "$SKILLS_DIR/"
-printf '  ✓ skills installed → %s/{retrospective,analyze-metrics}\n' "$SKILLS_DIR"
+cp -R "$REPO_DIR/skills/metrics-report"  "$SKILLS_DIR/"
+printf '  ✓ skills installed → %s/{retrospective,analyze-metrics,metrics-report}\n' "$SKILLS_DIR"
 
 cp "$REPO_DIR/config/pricing.json" "$METRICS_DIR/pricing.json"
 printf '  ✓ pricing config → %s/pricing.json\n' "$METRICS_DIR"
@@ -66,4 +67,5 @@ PY
 printf '\n✓ done. Restart Claude Code to activate the SessionEnd hook.\n'
 printf '  Metrics will land in %s/{auto,retro}.jsonl\n' "$METRICS_DIR"
 printf '  Run /retrospective at session end to capture subjective metrics.\n'
-printf '  Run /analyze-metrics any time to see the report.\n\n'
+printf '  Run /analyze-metrics any time for a markdown report.\n'
+printf '  Run /metrics-report for a static HTML report (no JS, no CDN).\n\n'

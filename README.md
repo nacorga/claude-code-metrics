@@ -3,7 +3,7 @@
 [![tests](https://github.com/nacorga/claude-code-metrics/actions/workflows/test.yml/badge.svg)](https://github.com/nacorga/claude-code-metrics/actions/workflows/test.yml)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
 
-**Instrumentation for agentic engineering.** Measure what your coding agent actually does — cost, tool usage, correction rate, task outcome — all in a local JSONL file. No dashboard, no database, no telemetry. Just data you can `grep`.
+**Instrumentation for agentic engineering.** Measure what your coding agent actually does — cost, tool usage, correction rate, task outcome — all in a local JSONL file. No dashboard, no database, no telemetry. Just data you can `grep`, `jq`, or render to a single self-contained HTML file with `/metrics-report`.
 
 ## Why
 
@@ -37,8 +37,11 @@ At the end of a session (optional but recommended), run:
 And whenever you want to see your data:
 
 ```
-/analyze-metrics
+/analyze-metrics    # markdown report in the conversation
+/metrics-report     # static HTML at ~/.claude/metrics/report.html
 ```
+
+Both accept the same `--since` and `--project` flags; `/metrics-report` writes a single self-contained HTML file (CSS + SVG inline, zero JavaScript, zero CDN) you can open with `open ~/.claude/metrics/report.html`.
 
 ## The four metrics
 
@@ -109,19 +112,19 @@ When Anthropic ships new model IDs, update [`config/pricing.json`](./config/pric
 
 Explicitly **not** on the roadmap for v0.x:
 
-- Web dashboard
+- Web dashboard / live server
 - SQLite / any database
 - Remote telemetry / cloud sync
 - Multi-user / team features
 
-The whole point is a single JSONL you own. If you want charts, pipe it into a notebook.
+The whole point is a single JSONL you own. One-shot derivative artefacts that read it (markdown via `/analyze-metrics`, static HTML via `/metrics-report`, your own notebook) are in scope; long-running processes are not.
 
 Things that **are** on the table:
 
 - `npx claude-code-metrics init` installer (v0.2)
 - Schema validation step in the hook
 - Opt-in markdown export for sharing anonymised benchmarks
-- Additional skills: `/metrics-export`, `/metrics-diff` (week over week)
+- Additional skills: `/metrics-diff` (week over week)
 
 ## Contributing
 
