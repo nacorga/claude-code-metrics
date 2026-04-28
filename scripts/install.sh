@@ -19,9 +19,14 @@ cp "$REPO_DIR/hooks/session_end.py" "$HOOKS_DIR/session_end.py"
 chmod +x "$HOOKS_DIR/session_end.py"
 printf '  ✓ hook installed → %s\n' "$HOOKS_DIR/session_end.py"
 
-cp -R "$REPO_DIR/skills/retrospective"   "$SKILLS_DIR/"
-cp -R "$REPO_DIR/skills/analyze-metrics" "$SKILLS_DIR/"
-cp -R "$REPO_DIR/skills/metrics-report"  "$SKILLS_DIR/"
+# Wipe any prior copy before re-copying — `cp -R` MERGES into existing dirs,
+# which silently leaves stale files (renamed or removed in the source) behind
+# and, in pathological past states, can leave nested skill subdirectories.
+# Removing first makes install truly idempotent regardless of prior state.
+for skill in retrospective analyze-metrics metrics-report; do
+  rm -rf "$SKILLS_DIR/$skill"
+  cp -R "$REPO_DIR/skills/$skill" "$SKILLS_DIR/"
+done
 printf '  ✓ skills installed → %s/{retrospective,analyze-metrics,metrics-report}\n' "$SKILLS_DIR"
 
 cp "$REPO_DIR/config/pricing.json" "$METRICS_DIR/pricing.json"
