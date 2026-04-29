@@ -34,17 +34,19 @@ Summarise the local metrics JSONL files. Read-only — writes nothing to disk.
    CCM_FILTER_PROJECT="$(echo "${ARGUMENTS:-}" | grep -oE '\-\-project[= ][^ ]+' | sed -E 's/^--project[= ]//' | tail -n1)" \
    python3 - <<'PY'
    import json, os, statistics, sys
-   from collections import Counter, defaultdict
    from pathlib import Path
 
-   # Helpers live next to this SKILL when installed (~/.claude/skills/analyze-metrics).
-   # The heredoc has no __file__, so resolve via the canonical install path.
+   # Helpers + aggregation logic live next to this SKILL when installed
+   # (~/.claude/skills/analyze-metrics). The heredoc has no __file__, so
+   # resolve via the canonical install path.
    _SKILL_DIR = Path.home() / ".claude" / "skills" / "analyze-metrics"
    sys.path.insert(0, str(_SKILL_DIR))
    from _helpers import (
        _parse_since, _window_label, _row_ts,
        _project_key, _project_label, _project_matches,
+       _latest_session_ts, _humanize_age, _recent_log_errors,
    )
+   from _aggregate import aggregate
 
    m = Path.home() / ".claude" / "metrics"
    raw = [json.loads(l) for l in (m / "auto.jsonl").read_text().splitlines() if l.strip()]
@@ -70,7 +72,15 @@ Summarise the local metrics JSONL files. Read-only — writes nothing to disk.
        retro = [json.loads(l) for l in retro_path.read_text().splitlines() if l.strip()]
    retro_by_id = {r["session_id"]: r for r in retro}
 
-   joined = [{**a, **retro_by_id.get(a["session_id"], {})} for a in auto]
+   pricing_path = m / "pricing.json"
+   pricing = {}
+   if pricing_path.is_file():
+       try:
+           pricing = json.loads(pricing_path.read_text())
+       except Exception:
+           pricing = {}
+
+   agg = aggregate(auto, retro_by_id, pricing)
 
    def table(headers, rows):
        out = ["| " + " | ".join(headers) + " |",
@@ -81,6 +91,11 @@ Summarise the local metrics JSONL files. Read-only — writes nothing to disk.
 
    print("# claude-code-metrics report\n")
    print(f"**Window:** {_window_label(since_raw, default_days=30)}  ·  **Project filter:** {proj_raw or 'all'}")
+   _last_age = _humanize_age(_latest_session_ts(auto_all))
+   _n_err = _recent_log_errors(m / "hook.log", days=7)
+   print(f"_Last logged session: {_last_age}  ·  hook errors (7d): {_n_err}_")
+   if _n_err > 0:
+       print(f"\n> ⚠ {_n_err} hook errors in the last 7 days — check `~/.claude/metrics/hook.log`\n")
    all_costs = [a.get("cost_usd") for a in auto_all if a.get("cost_usd") is not None]
    print(f"_All-time: {len(auto_all)} sessions, ${sum(all_costs):.4f} total cost_\n")
 
@@ -91,7 +106,7 @@ Summarise the local metrics JSONL files. Read-only — writes nothing to disk.
    print(f"- sessions in window: **{len(auto)}**")
    if err_count:
        print(f"- error rows excluded: **{err_count}** (no transcript / parse crash)")
-   costs = [a["cost_usd"] for a in auto if a.get("cost_usd") is not None]
+   costs = agg["costs"]
    print(f"- total estimated cost in window: **${sum(costs):.4f}**")
    print(f"- sessions with retro: **{len(retro)} / {len(auto)}**")
    ts = sorted(a["ts"] for a in auto if a.get("ts"))
@@ -100,44 +115,38 @@ Summarise the local metrics JSONL files. Read-only — writes nothing to disk.
    print()
 
    # Cost by model
-   by_model = defaultdict(list)
-   for a in auto:
-       if a.get("cost_usd") is not None:
-           by_model[a.get("model") or "unknown"].append(a["cost_usd"])
    print("## Cost by model\n")
-   rows = [(m, len(v), f"${statistics.mean(v):.4f}", f"${sum(v):.4f}") for m, v in sorted(by_model.items())]
+   by_model = agg["by_model"]
+   rows = [(m_, len(v), f"${statistics.mean(v):.4f}", f"${sum(v):.4f}")
+           for m_, v in sorted(by_model.items())]
    print(table(["model", "sessions", "avg cost", "total"], rows) if rows else "_no cost data_")
    print()
 
    # Cost by outcome (needs retro)
-   by_outcome = defaultdict(list)
-   for j in joined:
-       if j.get("task_outcome") and j.get("cost_usd") is not None:
-           by_outcome[j["task_outcome"]].append(j["cost_usd"])
    print("## Cost by task_outcome\n")
+   by_outcome = agg["by_outcome"]
    if by_outcome:
-       rows = [(o, len(v), f"${statistics.mean(v):.4f}", f"${sum(v):.4f}") for o, v in sorted(by_outcome.items())]
+       rows = [(o, len(v), f"${statistics.mean(v):.4f}", f"${sum(v):.4f}")
+               for o, v in sorted(by_outcome.items())]
        print(table(["outcome", "sessions", "avg cost", "total"], rows))
    else:
        print("_insufficient retro data_")
    print()
 
    # Correction rate by model (needs retro)
-   by_model_corr = defaultdict(list)
-   for j in joined:
-       if j.get("correction_rate") is not None and j.get("model"):
-           by_model_corr[j["model"]].append(j["correction_rate"])
    print("## Avg correction_rate by model\n")
+   by_model_corr = agg["by_model_corr"]
    if by_model_corr:
-       rows = [(m, len(v), f"{statistics.mean(v):.2f}") for m, v in sorted(by_model_corr.items())]
+       rows = [(m_, len(v), f"{statistics.mean(v):.2f}")
+               for m_, v in sorted(by_model_corr.items())]
        print(table(["model", "sessions", "avg correction (0-10)"], rows))
    else:
        print("_insufficient retro data_")
    print()
 
    # Skill trigger accuracy distribution
-   tri = Counter(j.get("skill_trigger_accuracy") for j in joined if j.get("skill_trigger_accuracy"))
    print("## Skill trigger accuracy\n")
+   tri = agg["trigger_accuracy"]
    if tri:
        rows = [(k, v) for k, v in sorted(tri.items())]
        print(table(["accuracy", "count"], rows))
@@ -147,8 +156,7 @@ Summarise the local metrics JSONL files. Read-only — writes nothing to disk.
 
    # Top 10 most expensive sessions
    print("## Top 10 most expensive sessions\n")
-   ranked = sorted((a for a in auto if a.get("cost_usd") is not None),
-                   key=lambda x: x["cost_usd"], reverse=True)[:10]
+   ranked = agg["top_expensive"]
    if ranked:
        rows = []
        for a in ranked:
@@ -164,23 +172,13 @@ Summarise the local metrics JSONL files. Read-only — writes nothing to disk.
    # cwd) so two repos with the same basename never collide. The displayed
    # label is the human-friendly form; if two distinct keys collapse to the
    # same label, disambiguate with a short suffix from the key.
-   by_proj_key = defaultdict(list)
-   for a in auto:
-       if a.get("cost_usd") is not None:
-           by_proj_key[_project_key(a)].append(a["cost_usd"])
-   label_keys = defaultdict(list)
-   for k in by_proj_key:
-       label_keys[_project_label(k)].append(k)
-   def _disambiguated_label(k):
-       label = _project_label(k)
-       if len(label_keys[label]) <= 1:
-           return label
-       suffix = k[-8:] if len(k) > 8 else k
-       return f"{label} ({suffix})"
    print("## Cost by project\n")
+   by_proj_key = agg["by_proj_key"]
    if by_proj_key:
+       from _aggregate import _disambiguated_label_factory
+       label = _disambiguated_label_factory(by_proj_key)
        rows = sorted(
-           ((_disambiguated_label(k), len(v),
+           ((label(k), len(v),
              f"${statistics.mean(v):.4f}", f"${sum(v):.4f}")
             for k, v in by_proj_key.items()),
            key=lambda r: float(r[3].lstrip("$")), reverse=True
@@ -192,11 +190,7 @@ Summarise the local metrics JSONL files. Read-only — writes nothing to disk.
 
    # Cache efficiency by model — read/(read+create); low ratio means context is being rebuilt repeatedly
    print("## Cache efficiency by model\n")
-   cache_by_model = defaultdict(lambda: [0, 0])  # [read, create]
-   for a in auto:
-       m_ = a.get("model") or "unknown"
-       cache_by_model[m_][0] += a.get("cache_read_tokens") or 0
-       cache_by_model[m_][1] += a.get("cache_creation_tokens") or 0
+   cache_by_model = agg["cache_by_model"]
    rows = []
    for m_, (r, c) in sorted(cache_by_model.items()):
        if r + c == 0:
@@ -211,64 +205,24 @@ Summarise the local metrics JSONL files. Read-only — writes nothing to disk.
    # Counterfactual: if cache_read tokens had been billed as input, the bill would be higher
    # by (input_rate - cache_read_rate) per cache_read token. Sums to a per-model and total figure.
    print("## Cache savings (counterfactual: no cache)\n")
-   pricing_path = m / "pricing.json"
-   pricing = {}
-   if pricing_path.is_file():
-       try:
-           pricing = json.loads(pricing_path.read_text())
-       except Exception:
-           pricing = {}
-
-   def _rates_for(model_id):
-       if not model_id or not pricing:
-           return None
-       keys = [k for k in pricing if not k.startswith("_") and model_id.startswith(k)]
-       keys.sort(key=len, reverse=True)
-       entry = pricing.get(keys[0]) if keys else pricing.get("_default")
-       if not entry:
-           return None
-       return entry.get("input"), entry.get("cache_read")
-
-   savings_by_model = defaultdict(lambda: [0.0, 0])  # [usd_saved, cache_read_tokens]
-   total_actual = 0.0
-   total_counterfactual = 0.0
-   for a in auto:
-       model_id = a.get("model") or ""
-       cr = a.get("cache_read_tokens") or 0
-       if cr <= 0:
-           continue
-       rates = _rates_for(model_id)
-       if not rates or rates[0] is None or rates[1] is None:
-           continue
-       rate_in, rate_cr = rates
-       saved = cr * (rate_in - rate_cr) / 1_000_000
-       savings_by_model[model_id or "unknown"][0] += saved
-       savings_by_model[model_id or "unknown"][1] += cr
-       if a.get("cost_usd") is not None:
-           total_actual += a["cost_usd"]
-           total_counterfactual += a["cost_usd"] + saved
-
+   savings_by_model = agg["savings_by_model"]
    if savings_by_model:
        rows = sorted(
            ((m_, f"{cr:,}", f"${s:.2f}") for m_, (s, cr) in savings_by_model.items()),
            key=lambda r: float(r[2].lstrip("$")), reverse=True,
        )
        print(table(["model", "cache_read tokens", "saved vs no-cache"], rows))
-       total_saved = sum(s for s, _ in savings_by_model.values())
-       print(f"\n_total saved by cache: **${total_saved:.2f}**_")
-       if total_actual > 0:
-           ratio = total_counterfactual / total_actual
-           print(f"_actual estimated cost ${total_actual:.2f} vs no-cache counterfactual ${total_counterfactual:.2f} ({ratio:.1f}× cheaper with cache)_")
+       print(f"\n_total saved by cache: **${agg['total_saved']:.2f}**_")
+       if agg["total_actual"] > 0:
+           ratio = agg["total_counterfactual"] / agg["total_actual"]
+           print(f"_actual estimated cost ${agg['total_actual']:.2f} vs no-cache counterfactual ${agg['total_counterfactual']:.2f} ({ratio:.1f}× cheaper with cache)_")
    else:
        print("_no cache_read tokens captured, or pricing.json unavailable_")
    print()
 
    # Marathon sessions — turn_count > 300 indicates autonomous runs that drift expensive
    print("## Marathon sessions (turn_count > 300)\n")
-   marathons = sorted(
-       (a for a in auto if (a.get("turn_count") or 0) > 300),
-       key=lambda x: x.get("cost_usd") or 0, reverse=True
-   )[:10]
+   marathons = agg["marathons"]
    if marathons:
        rows = []
        for a in marathons:
@@ -278,24 +232,21 @@ Summarise the local metrics JSONL files. Read-only — writes nothing to disk.
            rows.append((a["session_id"][:12], a.get("turn_count"), tools, f"${cost:.2f}", proj_label))
        print(table(["session_id", "turns", "tool calls", "cost", "project"], rows))
        print()
-       n = len(marathons)
-       total_cost = sum(a.get("cost_usd") or 0 for a in auto if (a.get("turn_count") or 0) > 300)
+       n = agg["marathon_total_count"]
+       total_cost = agg["marathon_total_cost"]
        all_cost = sum(costs)
        pct = total_cost / all_cost * 100 if all_cost else 0
-       print(f"_{n} marathon sessions account for ${total_cost:.2f} ({pct:.1f}% of total spend)._")
+       extra = f" (showing top {len(marathons)})" if n > len(marathons) else ""
+       print(f"_{n} marathon sessions account for ${total_cost:.2f} ({pct:.1f}% of total spend){extra}._")
    else:
        print("_no marathon sessions detected_")
    print()
 
    # Top tools across ALL sessions — aggregated tool_distribution
    print("## Top tools across all sessions\n")
-   tool_totals = Counter()
-   for a in auto:
-       td = a.get("tool_distribution") or {}
-       for t, c in td.items():
-           tool_totals[t] += c
+   tool_totals = agg["tool_totals"]
    if tool_totals:
-       rows = [(t, n) for t, n in tool_totals.most_common(15)]
+       rows = sorted(tool_totals.items(), key=lambda kv: kv[1], reverse=True)[:15]
        print(table(["tool", "total calls"], rows))
    else:
        print("_no tool data_")
@@ -303,17 +254,12 @@ Summarise the local metrics JSONL files. Read-only — writes nothing to disk.
 
    # Subagent usage (v3+) — only available on rows captured by the v3 hook
    print("## Subagent invocations (v3+ rows only)\n")
-   sub_totals = Counter()
-   v3_rows = 0
-   for a in auto:
-       if "subagent_invocations" in a:
-           v3_rows += 1
-           for s, c in (a.get("subagent_invocations") or {}).items():
-               sub_totals[s] += c
+   sub_totals = agg["sub_totals"]
+   v3_rows = agg["v3_sub_rows"]
    if v3_rows == 0:
        print("_no v3 sessions yet — schema bump captures this going forward_")
    elif sub_totals:
-       rows = [(s, n) for s, n in sub_totals.most_common()]
+       rows = sorted(sub_totals.items(), key=lambda kv: kv[1], reverse=True)
        print(table(["subagent", "invocations"], rows))
        print(f"\n_aggregated over {v3_rows} v3 sessions_")
    else:
@@ -325,25 +271,8 @@ Summarise the local metrics JSONL files. Read-only — writes nothing to disk.
    # so we measure the return surface: chars, duration, errors. This is what actually
    # bloats the parent's context window and drives cost/latency.
    print("## Subagent return surface (v4+ rows only)\n")
-   surface = defaultdict(lambda: {
-       "count": 0, "return_chars": 0, "duration_s": 0.0,
-       "errors": 0, "max_chars": 0, "max_dur": 0.0,
-   })
-   v4_rows = 0
-   for a in auto:
-       if "subagent_stats" not in a:
-           continue
-       v4_rows += 1
-       for sub, stat in (a.get("subagent_stats") or {}).items():
-           s = surface[sub]
-           s["count"] += stat.get("count") or 0
-           s["return_chars"] += stat.get("return_chars_total") or 0
-           s["duration_s"] += stat.get("duration_s_total") or 0.0
-           s["errors"] += stat.get("errors") or 0
-           if (stat.get("max_return_chars") or 0) > s["max_chars"]:
-               s["max_chars"] = stat.get("max_return_chars") or 0
-           if (stat.get("max_duration_s") or 0) > s["max_dur"]:
-               s["max_dur"] = stat.get("max_duration_s") or 0
+   surface = agg["surface"]
+   v4_rows = agg["v4_rows"]
    if v4_rows == 0:
        print("_no v4 sessions yet — schema bump captures this going forward_")
    elif surface:
@@ -391,25 +320,18 @@ Summarise the local metrics JSONL files. Read-only — writes nothing to disk.
    # High counts suggest the subagent overhead was wasted; a direct grep/Read
    # would have produced the same answer cheaper and faster.
    print("## Cheap subagent calls (v4+ rows only)\n")
-   v4_with_field = [a for a in auto if "cheap_subagent_calls" in a]
-   if not v4_with_field:
+   cheap_rows = agg["cheap_rows"]
+   if cheap_rows == 0:
        print("_no v4 sessions yet_")
    else:
-       cheap_total = sum(a.get("cheap_subagent_calls") or 0 for a in v4_with_field)
-       sub_total = sum(
-           sum((a.get("subagent_stats") or {}).get(s, {}).get("count") or 0
-               for s in (a.get("subagent_stats") or {}))
-           for a in v4_with_field
-       )
+       cheap_total = agg["cheap_total"]
+       sub_total = agg["cheap_dispatches"]
        if sub_total == 0:
-           print(f"_no Agent calls across {len(v4_with_field)} v4 sessions_")
+           print(f"_no Agent calls across {cheap_rows} v4 sessions_")
        else:
            pct = cheap_total / sub_total * 100
            print(f"**{cheap_total} of {sub_total} subagent dispatches ({pct:.1f}%) returned <200 chars** — likely solvable with a direct grep/Read.\n")
-           offenders = sorted(
-               (a for a in v4_with_field if (a.get("cheap_subagent_calls") or 0) > 0),
-               key=lambda x: x.get("cheap_subagent_calls") or 0, reverse=True,
-           )[:5]
+           offenders = agg["cheap_offenders"]
            if offenders:
                rows = []
                for a in offenders:
@@ -426,19 +348,17 @@ Summarise the local metrics JSONL files. Read-only — writes nothing to disk.
 
    # Tool errors aggregated (v3+) — uses the captured field, no transcript reads
    print("## Tool errors — top 10 sessions (v3+ rows)\n")
-   v3_with_errors = [a for a in auto if a.get("tool_errors_count") is not None and a.get("tool_errors_count") > 0]
-   v3_with_errors.sort(key=lambda x: x.get("tool_errors_count") or 0, reverse=True)
-   if v3_with_errors:
+   tool_errors = agg["tool_errors"]
+   v3_err_count = agg["v3_err_count"]
+   if tool_errors:
        rows = []
-       for a in v3_with_errors[:10]:
+       for a in tool_errors:
            proj_label = _project_label(_project_key(a)) or "-"
            cost = a.get("cost_usd") or 0
            rows.append((a["session_id"][:12], a.get("tool_errors_count"), f"${cost:.2f}", proj_label))
        print(table(["session_id", "errors", "cost", "project"], rows))
-       total_err = sum(a.get("tool_errors_count") or 0 for a in auto)
-       v3_count = sum(1 for a in auto if "tool_errors_count" in a)
-       print(f"\n_total: {total_err} tool errors across {v3_count} v3 sessions_")
-   elif any("tool_errors_count" in a for a in auto):
+       print(f"\n_total: {agg['total_errors']} tool errors across {v3_err_count} v3 sessions_")
+   elif v3_err_count > 0:
        print("_no tool errors detected in v3 sessions_")
    else:
        print("_no v3 sessions yet_")
@@ -446,16 +366,11 @@ Summarise the local metrics JSONL files. Read-only — writes nothing to disk.
 
    # Correction-heavy sessions (v3+) — high-signal candidates for retro
    print("## Correction-heavy sessions (v3+, by short_followups + correction_keywords)\n")
-   v3_corr = [a for a in auto
-              if "short_user_followups_count" in a
-              and ((a.get("short_user_followups_count") or 0) + (a.get("correction_keyword_hits") or 0)) > 0]
-   v3_corr.sort(
-       key=lambda x: (x.get("short_user_followups_count") or 0) + (x.get("correction_keyword_hits") or 0),
-       reverse=True,
-   )
+   v3_corr = agg["correction_heavy"]
+   any_v3_corr_field = any("short_user_followups_count" in a for a in auto)
    if v3_corr:
        rows = []
-       for a in v3_corr[:10]:
+       for a in v3_corr:
            proj_label = _project_label(_project_key(a)) or "-"
            cost = a.get("cost_usd") or 0
            rows.append((
@@ -466,7 +381,7 @@ Summarise the local metrics JSONL files. Read-only — writes nothing to disk.
                proj_label,
            ))
        print(table(["session_id", "short_fups", "kw_hits", "cost", "project"], rows))
-   elif any("short_user_followups_count" in a for a in auto):
+   elif any_v3_corr_field:
        print("_no friction signals detected in v3 sessions_")
    else:
        print("_no v3 sessions yet_")
@@ -474,20 +389,7 @@ Summarise the local metrics JSONL files. Read-only — writes nothing to disk.
 
    # Cost trend by ISO week — measures impact of setup changes over time
    print("## Cost trend by ISO week\n")
-   from datetime import datetime as _dt
-   by_week = defaultdict(lambda: [0.0, 0])  # [cost, sessions]
-   for a in auto:
-       ts = a.get("ts")
-       if not ts or a.get("cost_usd") is None:
-           continue
-       try:
-           dt = _dt.fromisoformat(ts.replace("Z", "+00:00"))
-       except Exception:
-           continue
-       y, w, _ = dt.isocalendar()
-       key = f"{y}-W{w:02d}"
-       by_week[key][0] += a["cost_usd"]
-       by_week[key][1] += 1
+   by_week = agg["by_week"]
    if by_week:
        rows = [(k, n, f"${c:.2f}", f"${c/n:.2f}") for k, (c, n) in sorted(by_week.items())]
        print(table(["week", "sessions", "total", "avg/session"], rows))

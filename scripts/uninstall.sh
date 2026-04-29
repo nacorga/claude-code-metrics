@@ -33,6 +33,7 @@ printf '\n→ uninstalling claude-code-metrics from %s\n' "$CLAUDE_HOME"
 rm -f "$HOOKS_DIR/session_end.py"           && printf '  ✓ removed hook script\n' || true
 rm -rf "$SKILLS_DIR/retrospective"          && printf '  ✓ removed /retrospective skill\n' || true
 rm -rf "$SKILLS_DIR/analyze-metrics"        && printf '  ✓ removed /analyze-metrics skill\n' || true
+rm -rf "$SKILLS_DIR/metrics-report"         && printf '  ✓ removed /metrics-report skill\n' || true
 rm -f "$METRICS_DIR/pricing.json"           && printf '  ✓ removed pricing config\n' || true
 
 if [ -f "$SETTINGS" ]; then
