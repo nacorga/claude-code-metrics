@@ -44,6 +44,7 @@ Summarise the local metrics JSONL files. Read-only — writes nothing to disk.
    from _helpers import (
        _parse_since, _window_label, _row_ts,
        _project_key, _project_label, _project_matches,
+       _latest_session_ts, _humanize_age, _recent_log_errors,
    )
    from _aggregate import aggregate
 
@@ -90,6 +91,11 @@ Summarise the local metrics JSONL files. Read-only — writes nothing to disk.
 
    print("# claude-code-metrics report\n")
    print(f"**Window:** {_window_label(since_raw, default_days=30)}  ·  **Project filter:** {proj_raw or 'all'}")
+   _last_age = _humanize_age(_latest_session_ts(auto_all))
+   _n_err = _recent_log_errors(m / "hook.log", days=7)
+   print(f"_Last logged session: {_last_age}  ·  hook errors (7d): {_n_err}_")
+   if _n_err > 0:
+       print(f"\n> ⚠ {_n_err} hook errors in the last 7 days — check `~/.claude/metrics/hook.log`\n")
    all_costs = [a.get("cost_usd") for a in auto_all if a.get("cost_usd") is not None]
    print(f"_All-time: {len(auto_all)} sessions, ${sum(all_costs):.4f} total cost_\n")
 

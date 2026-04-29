@@ -7,7 +7,7 @@ Guidance for Claude Code (and contributors) working in this repo. See [README.md
 - **JSONL-only.** No SQLite, no embedded DB, no server, no dashboard. Output is plain JSON lines the user can `grep`, `jq`, pipe into a notebook. *(One-shot derivative artefacts that read JSONL — markdown, CSV, static self-contained HTML — are fine; long-running processes and live dashboards are not.)*
 - **Zero runtime deps.** Hook uses stdlib Python 3.9+. Installer uses bash + python3. If a feature needs a dep, reconsider the feature.
 - **Always local.** The hook must never make a network call. No telemetry, no remote reporting, no "opt-in analytics".
-- **Never block Claude Code.** The hook must always `exit 0`, even on crashes. Any failure logs to `~/.claude/metrics/hook.log` and moves on.
+- **Never block Claude Code.** The hook must always `exit 0`, even on crashes. Any failure logs to `~/.claude/metrics/hook.log` (rotated to `hook.log.1` at 1MB; one generation kept) and moves on. Recent log errors are surfaced as a warning in `/analyze-metrics` and `/metrics-report` so silent breakage gets noticed.
 - **Return to the shell in <100ms.** Heavy work (transcript parsing) runs in a double-forked, detached grandchild. Large sessions (60MB+ transcripts) cannot stall session close. Set `CCM_NO_FORK=1` for synchronous execution (tests).
 - **Append-only.** We never rewrite `auto.jsonl` / `retro.jsonl`. Migrations happen by bumping `schema_version` and letting old + new rows coexist.
 - **Repo SKILL.md is ground truth, not the installed copy.** `~/.claude/skills/{retrospective,analyze-metrics,metrics-report}/SKILL.md` are install artefacts. Edits made directly there are lost on the next `scripts/install.sh`. Always edit the repo source and re-install.
@@ -20,7 +20,7 @@ Guidance for Claude Code (and contributors) working in this repo. See [README.md
 | `config/pricing.json`                 | Model pricing table (prefix match + `_default` fallback)        |
 | `skills/retrospective/SKILL.md`       | Manual `/retrospective` — captures subjective metrics           |
 | `skills/analyze-metrics/SKILL.md`     | Manual `/analyze-metrics` — markdown report from local JSONL    |
-| `skills/analyze-metrics/_helpers.py`  | Shared filter / project-identity helpers (also used by `/metrics-report`) |
+| `skills/analyze-metrics/_helpers.py`  | Shared filter / project-identity / health-signal helpers (also used by `/metrics-report`) |
 | `skills/analyze-metrics/_aggregate.py`| Shared aggregation logic — single source of truth for every cut both reports show. Imported by `/analyze-metrics` and `/metrics-report` to keep the markdown and HTML formats in lockstep. |
 | `skills/metrics-report/SKILL.md`      | Manual `/metrics-report` — invokes `_render.py`                 |
 | `skills/metrics-report/_render.py`    | Static HTML report generator. Stdlib-only, no JS, no CDN        |

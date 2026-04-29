@@ -490,6 +490,19 @@ header.hero .meta {
   line-height: var(--leading-snug);
   overflow-wrap: anywhere;
 }
+header.hero .meta + .meta {
+  margin-top: var(--sp-1);
+}
+header.hero .health-warning {
+  margin: var(--sp-2) 0 0;
+  padding: var(--sp-2) var(--sp-3);
+  border-left: 3px solid #b00020;
+  background: rgba(176, 0, 32, 0.06);
+  color: #b00020;
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  font-weight: 600;
+}
 
 /* =========================================================
    KPI cards
@@ -829,6 +842,16 @@ def _render_hero(meta: dict, agg: dict, all_time: dict) -> str:
         f'{_fmt_money(all_time["total_cost"])} total'
     )
 
+    n_err = meta.get("recent_hook_errors", 0) or 0
+    last_age = meta.get("last_session_age", "never")
+    health_line = (
+        f'Last session: {_esc(last_age)}  ·  hook errors (7d): {_esc(str(n_err))}'
+    )
+    warning_html = (
+        f'<p class="health-warning">⚠ {n_err} hook errors in the last 7 days '
+        '— check <code>~/.claude/metrics/hook.log</code></p>'
+    ) if n_err > 0 else ''
+
     header = (
         '<header class="hero">'
         '<h1>claude-code-metrics</h1>'
@@ -836,6 +859,8 @@ def _render_hero(meta: dict, agg: dict, all_time: dict) -> str:
         f'  ·  project: {_esc(meta["project_filter"])}'
         f'  ·  schema rows: {_esc(schema_str)}</p>'
         f'<p class="meta">{_esc(all_time_str)}</p>'
+        f'<p class="meta">{health_line}</p>'
+        f'{warning_html}'
         '</header>'
         f'<section id="hero" aria-label="overview">'
         f'<div class="kpis">{kpis}</div>'
@@ -1442,7 +1467,8 @@ def render_html(auto: list[dict], retro: list[dict], pricing: dict,
 
 def _build_meta(args, n_sessions: int, err_count: int,
                 retro_count: int, ts_range: tuple[str, str] | None,
-                source_path: Path, schema_versions: list) -> dict:
+                source_path: Path, schema_versions: list,
+                auto_all: list[dict], log_path: Path) -> dict:
     project_filter = (args.project or "").strip() or "all"
     cmd_parts = ["python3 _render.py"]
     if args.since:
@@ -1462,6 +1488,8 @@ def _build_meta(args, n_sessions: int, err_count: int,
         "command": " ".join(cmd_parts),
         "source_path": source_path,
         "schema_versions": schema_versions,
+        "last_session_age": _h._humanize_age(_h._latest_session_ts(auto_all)),
+        "recent_hook_errors": _h._recent_log_errors(log_path, days=7),
     }
 
 
@@ -1527,7 +1555,8 @@ def main(argv: list[str] | None = None) -> int:
     })
 
     meta = _build_meta(args, len(auto), err_count, retro_count, ts_range,
-                       auto_path, schema_versions)
+                       auto_path, schema_versions,
+                       auto_all, metrics_dir / "hook.log")
 
     all_time_costs = [a.get("cost_usd") for a in auto_all
                       if a.get("cost_usd") is not None]

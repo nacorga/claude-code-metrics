@@ -77,6 +77,8 @@ METRICS_DIR = Path.home() / ".claude" / "metrics"
 AUTO_JSONL = METRICS_DIR / "auto.jsonl"
 LOCK_PATH = METRICS_DIR / ".auto.lock"
 LOG_PATH = METRICS_DIR / "hook.log"
+LOG_PATH_PREV = METRICS_DIR / "hook.log.1"
+LOG_MAX_BYTES = 1 * 1024 * 1024  # 1 MB; rotates to hook.log.1 (one generation kept)
 
 # Pricing config: first looks next to this script (repo layout), then at
 # ~/.claude/metrics/pricing.json (installed layout).
@@ -93,6 +95,11 @@ SKIP_REASONS = {"compact", "clear", "prompt_input_submit"}
 def log(msg: str) -> None:
     try:
         METRICS_DIR.mkdir(parents=True, exist_ok=True)
+        try:
+            if LOG_PATH.stat().st_size > LOG_MAX_BYTES:
+                os.replace(LOG_PATH, LOG_PATH_PREV)
+        except FileNotFoundError:
+            pass
         with LOG_PATH.open("a") as f:
             f.write(f"[{datetime.now(timezone.utc).isoformat()}] {msg}\n")
     except Exception:

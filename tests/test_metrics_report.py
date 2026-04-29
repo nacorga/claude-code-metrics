@@ -438,6 +438,63 @@ class TestErrorRows(unittest.TestCase):
             fx.cleanup()
 
 
+class TestHealthSignal(unittest.TestCase):
+    """The hero header carries an at-a-glance health signal: time since last
+    logged session, plus a count of recent hook errors. When the count is
+    nonzero, a warning paragraph must appear so silent hook breakage gets
+    surfaced to the user — that's the whole point of the feature."""
+
+    def _write_log(self, fx: _Fixture, lines: list[str]) -> None:
+        (fx.metrics_dir / "hook.log").write_text("\n".join(lines) + "\n")
+
+    def test_clean_log_renders_health_line_no_warning(self):
+        rows = [_make_row(session_id="s1", ts=_ts(0), cost_usd=0.10)]
+        fx = _Fixture(rows)
+        try:
+            rc, html, _ = fx.run("--since", "all")
+            self.assertEqual(rc, 0)
+            self.assertIn("Last session:", html)
+            self.assertIn("hook errors (7d): 0", html)
+            # The CSS class definition lives in <style> on every render;
+            # only the warning *paragraph* is conditional. Check for the
+            # tag, not the bare class name.
+            self.assertNotIn('<p class="health-warning">', html)
+        finally:
+            fx.cleanup()
+
+    def test_recent_errors_render_warning_paragraph(self):
+        rows = [_make_row(session_id="s1", ts=_ts(0), cost_usd=0.10)]
+        fx = _Fixture(rows)
+        try:
+            now = datetime.now(timezone.utc)
+            recent = (now - timedelta(hours=2)).isoformat()
+            self._write_log(fx, [
+                f"[{recent}] hook crashed parsing payload",
+                f"[{recent}] another failure",
+            ])
+            rc, html, _ = fx.run("--since", "all")
+            self.assertEqual(rc, 0)
+            self.assertIn("hook errors (7d): 2", html)
+            self.assertIn('<p class="health-warning">', html)
+            self.assertIn("hook errors in the last 7 days", html)
+        finally:
+            fx.cleanup()
+
+    def test_old_log_lines_outside_window_dont_warn(self):
+        rows = [_make_row(session_id="s1", ts=_ts(0), cost_usd=0.10)]
+        fx = _Fixture(rows)
+        try:
+            now = datetime.now(timezone.utc)
+            old = (now - timedelta(days=30)).isoformat()
+            self._write_log(fx, [f"[{old}] long-ago crash"])
+            rc, html, _ = fx.run("--since", "all")
+            self.assertEqual(rc, 0)
+            self.assertIn("hook errors (7d): 0", html)
+            self.assertNotIn('<p class="health-warning">', html)
+        finally:
+            fx.cleanup()
+
+
 class TestSubprocessEntrypoint(unittest.TestCase):
     """Verify the script is runnable as `python3 _render.py ...` directly,
     matching how SKILL.md invokes it."""

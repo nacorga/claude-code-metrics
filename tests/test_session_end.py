@@ -811,5 +811,76 @@ class TestCaptureGitMetadata(unittest.TestCase):
         self.assertEqual(row["git_remote_origin"], "github.com/foo/bar")
 
 
+class TestLogRotation(unittest.TestCase):
+    """`log()` must cap hook.log at LOG_MAX_BYTES by rotating to hook.log.1.
+
+    Rotation is the only growth bound on the debug log (the hook itself
+    never raises and writes to it on every code path), so this is the
+    health-of-the-app contract — not a cosmetic concern.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="ccm_logrot_"))
+        # Snapshot the module constants we'll patch so tearDown can restore
+        # them — never mutate test state without a guaranteed restore path.
+        self._orig_metrics_dir = session_end.METRICS_DIR
+        self._orig_log_path = session_end.LOG_PATH
+        self._orig_log_path_prev = session_end.LOG_PATH_PREV
+        self._orig_max_bytes = session_end.LOG_MAX_BYTES
+        session_end.METRICS_DIR = self.tmp
+        session_end.LOG_PATH = self.tmp / "hook.log"
+        session_end.LOG_PATH_PREV = self.tmp / "hook.log.1"
+        # Tiny cap keeps tests fast without changing the rotation logic.
+        session_end.LOG_MAX_BYTES = 256
+
+    def tearDown(self):
+        session_end.METRICS_DIR = self._orig_metrics_dir
+        session_end.LOG_PATH = self._orig_log_path
+        session_end.LOG_PATH_PREV = self._orig_log_path_prev
+        session_end.LOG_MAX_BYTES = self._orig_max_bytes
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_under_threshold_does_not_rotate(self):
+        session_end.log("first")
+        session_end.log("second")
+        self.assertTrue(session_end.LOG_PATH.is_file())
+        self.assertFalse(session_end.LOG_PATH_PREV.exists())
+        body = session_end.LOG_PATH.read_text()
+        self.assertIn("first", body)
+        self.assertIn("second", body)
+
+    def test_over_threshold_rotates_to_prev(self):
+        # Pre-fill log past the cap, then write a new line — that write must
+        # observe the rotation and start fresh.
+        session_end.LOG_PATH.write_text("x" * (session_end.LOG_MAX_BYTES + 1))
+        old_size = session_end.LOG_PATH.stat().st_size
+        session_end.log("after-rotate")
+        self.assertTrue(session_end.LOG_PATH_PREV.is_file())
+        self.assertEqual(session_end.LOG_PATH_PREV.stat().st_size, old_size)
+        new_body = session_end.LOG_PATH.read_text()
+        self.assertIn("after-rotate", new_body)
+        # New file should contain only the post-rotation line, not the old
+        # bytes.
+        self.assertNotIn("x" * 100, new_body)
+
+    def test_existing_prev_is_overwritten(self):
+        (session_end.LOG_PATH_PREV).write_text("STALE-PREV-CONTENT")
+        session_end.LOG_PATH.write_text("y" * (session_end.LOG_MAX_BYTES + 1))
+        session_end.log("after-rotate")
+        # os.replace must clobber the prior .1 without raising.
+        self.assertNotIn("STALE-PREV-CONTENT",
+                         session_end.LOG_PATH_PREV.read_text())
+        self.assertIn("y" * 100, session_end.LOG_PATH_PREV.read_text())
+
+    def test_log_never_raises_on_unwritable_dir(self):
+        # Point at a path that cannot exist — log() must swallow any error
+        # so it can never block the hook.
+        session_end.METRICS_DIR = Path("/proc/0/cannot/create")
+        session_end.LOG_PATH = session_end.METRICS_DIR / "hook.log"
+        session_end.LOG_PATH_PREV = session_end.METRICS_DIR / "hook.log.1"
+        # Must not raise.
+        session_end.log("should be silently dropped")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -302,5 +302,116 @@ class TestEnvToFilterPipeline(unittest.TestCase):
         self.assertEqual(ids, {"recent-other"})
 
 
+class TestLatestSessionTs(unittest.TestCase):
+
+    def test_empty_rows_return_none(self):
+        self.assertIsNone(h._latest_session_ts([]))
+
+    def test_picks_max_across_valid_rows(self):
+        rows = [
+            {"ts": "2026-04-01T10:00:00Z"},
+            {"ts": "2026-04-15T10:00:00Z"},
+            {"ts": "2026-04-10T10:00:00Z"},
+        ]
+        self.assertEqual(
+            h._latest_session_ts(rows),
+            datetime(2026, 4, 15, 10, 0, 0, tzinfo=timezone.utc),
+        )
+
+    def test_skips_rows_with_missing_or_malformed_ts(self):
+        rows = [
+            {"ts": "2026-04-01T10:00:00Z"},
+            {"ts": "garbage"},
+            {},  # missing ts entirely
+            {"ts": None},
+        ]
+        self.assertEqual(
+            h._latest_session_ts(rows),
+            datetime(2026, 4, 1, 10, 0, 0, tzinfo=timezone.utc),
+        )
+
+
+class TestHumanizeAge(unittest.TestCase):
+
+    def test_none_returns_never(self):
+        self.assertEqual(h._humanize_age(None, now=FROZEN_NOW), "never")
+
+    def test_under_a_minute_is_just_now(self):
+        dt = FROZEN_NOW - timedelta(seconds=20)
+        self.assertEqual(h._humanize_age(dt, now=FROZEN_NOW), "just now")
+
+    def test_minute_resolution(self):
+        dt = FROZEN_NOW - timedelta(minutes=12)
+        self.assertEqual(h._humanize_age(dt, now=FROZEN_NOW), "12m ago")
+
+    def test_hour_resolution(self):
+        dt = FROZEN_NOW - timedelta(hours=4, minutes=30)
+        self.assertEqual(h._humanize_age(dt, now=FROZEN_NOW), "4h ago")
+
+    def test_day_resolution(self):
+        dt = FROZEN_NOW - timedelta(days=3)
+        self.assertEqual(h._humanize_age(dt, now=FROZEN_NOW), "3d ago")
+
+    def test_future_timestamp_collapses_to_just_now(self):
+        # Clock skew between machines / NTP correction must not produce a
+        # negative or nonsense age in the report header.
+        dt = FROZEN_NOW + timedelta(minutes=5)
+        self.assertEqual(h._humanize_age(dt, now=FROZEN_NOW), "just now")
+
+
+class TestRecentLogErrors(unittest.TestCase):
+
+    def setUp(self):
+        import tempfile
+        self.tmp = Path(tempfile.mkdtemp(prefix="ccm_logerr_"))
+        self.log_path = self.tmp / "hook.log"
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_missing_file_returns_zero(self):
+        self.assertEqual(
+            h._recent_log_errors(self.log_path, days=7, now=FROZEN_NOW),
+            0,
+        )
+
+    def test_counts_lines_within_window(self):
+        recent_a = (FROZEN_NOW - timedelta(hours=1)).isoformat()
+        recent_b = (FROZEN_NOW - timedelta(days=2)).isoformat()
+        old = (FROZEN_NOW - timedelta(days=30)).isoformat()
+        self.log_path.write_text(
+            f"[{recent_a}] boom\n"
+            f"[{recent_b}] fizz\n"
+            f"[{old}] ancient\n"
+        )
+        self.assertEqual(
+            h._recent_log_errors(self.log_path, days=7, now=FROZEN_NOW),
+            2,
+        )
+
+    def test_malformed_lines_are_ignored_silently(self):
+        recent = (FROZEN_NOW - timedelta(hours=1)).isoformat()
+        self.log_path.write_text(
+            "no timestamp prefix at all\n"
+            f"[not-an-iso-date] junk\n"
+            f"[{recent}] real one\n"
+            "[] empty bracket\n"
+        )
+        self.assertEqual(
+            h._recent_log_errors(self.log_path, days=7, now=FROZEN_NOW),
+            1,
+        )
+
+    def test_returns_zero_on_unreadable_path(self):
+        # Directory in place of a file → open() raises IsADirectoryError /
+        # OSError; helper must coerce to 0 rather than propagate.
+        (self.tmp / "subdir").mkdir()
+        self.assertEqual(
+            h._recent_log_errors(self.tmp / "subdir", days=7, now=FROZEN_NOW),
+            0,
+        )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
