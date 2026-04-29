@@ -880,6 +880,48 @@ class TestLogRotation(unittest.TestCase):
         session_end.LOG_PATH_PREV = session_end.METRICS_DIR / "hook.log.1"
         # Must not raise.
         session_end.log("should be silently dropped")
+        session_end.log_error("error path must also be silent")
+
+
+class TestLogSeverity(unittest.TestCase):
+    """`log()` is INFO; `log_error()` is ERROR. The /analyze-metrics health
+    signal counts only ERROR — pinning the format here keeps the hook and the
+    helper in lockstep."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="ccm_logsev_"))
+        self._orig_metrics_dir = session_end.METRICS_DIR
+        self._orig_log_path = session_end.LOG_PATH
+        self._orig_log_path_prev = session_end.LOG_PATH_PREV
+        session_end.METRICS_DIR = self.tmp
+        session_end.LOG_PATH = self.tmp / "hook.log"
+        session_end.LOG_PATH_PREV = self.tmp / "hook.log.1"
+
+    def tearDown(self):
+        session_end.METRICS_DIR = self._orig_metrics_dir
+        session_end.LOG_PATH = self._orig_log_path
+        session_end.LOG_PATH_PREV = self._orig_log_path_prev
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_log_writes_info_tag(self):
+        session_end.log("normal event")
+        body = session_end.LOG_PATH.read_text()
+        self.assertIn("[INFO] normal event", body)
+        self.assertNotIn("[ERROR]", body)
+
+    def test_log_error_writes_error_tag(self):
+        session_end.log_error("real failure")
+        body = session_end.LOG_PATH.read_text()
+        self.assertIn("[ERROR] real failure", body)
+
+    def test_line_format_starts_with_iso_timestamp(self):
+        # Format contract: [<iso8601>] [<LEVEL>] <message>. The helper
+        # _recent_log_errors parses this exact shape.
+        session_end.log_error("boom")
+        line = session_end.LOG_PATH.read_text().splitlines()[0]
+        # Cheap structural check: opens with '[', has ']', then ' [LEVEL] '.
+        self.assertTrue(line.startswith("["), line)
+        self.assertIn("] [ERROR] ", line)
 
 
 if __name__ == "__main__":

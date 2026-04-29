@@ -181,41 +181,75 @@ def _humanize_age(dt: datetime | None, now: datetime | None = None) -> str:
     return f"{days}d ago"
 
 
-# Hook log lines start with "[<iso8601>] ", followed by free-form text.
-_LOG_LINE_TS = re.compile(r"^\[([^\]]+)\]")
-# Defensive cap: even if rotation in the hook ever fails, never read more
-# than this from the log when counting recent errors. 10MB > 5x our rotated
-# 2MB ceiling — generous safety margin without ever being slow.
+# Hook log lines have the shape "[<iso8601>] [<LEVEL>] free-form text" since
+# v0.x's severity-tagged logging. Pre-tag lines (legacy logs) won't match the
+# level group and are silently ignored — the health signal stays meaningful
+# even when the log file straddles an upgrade.
+_LOG_LINE_FORMAT = re.compile(r"^\[([^\]]+)\]\s*\[(?P<level>[A-Z]+)\]")
+
+# Defensive cap when reading the log. The hook rotates each file at 1MB so
+# total log volume on disk is bounded near 2MB; this cap (10MB) is the
+# belt-and-braces ceiling for runaway pre-rotation states. We tail-read so
+# the most recent entries always fit in the window.
 _LOG_READ_CAP = 10 * 1024 * 1024
+
+
+def _read_log_tail(log_path: Path, max_bytes: int) -> str:
+    """Read up to `max_bytes` from the END of `log_path`. If the file is
+    larger than the cap, the leading partial line is dropped so we never
+    half-parse a timestamp. Returns '' on any I/O failure or empty file."""
+    try:
+        size = log_path.stat().st_size
+    except OSError:
+        return ""
+    if size == 0:
+        return ""
+    try:
+        with log_path.open("rb") as f:
+            if size > max_bytes:
+                f.seek(size - max_bytes)
+            data = f.read()
+    except OSError:
+        return ""
+    text = data.decode("utf-8", errors="replace")
+    if size > max_bytes:
+        nl = text.find("\n")
+        if nl >= 0:
+            text = text[nl + 1:]
+    return text
 
 
 def _recent_log_errors(log_path: Path, days: int = 7,
                        now: datetime | None = None) -> int:
-    """Count lines in `log_path` whose ISO timestamp falls within `days` of
-    `now`. Returns 0 on any failure (missing file, unreadable, malformed) —
-    the health signal must never raise; an unreadable log is itself a clue
-    the user can investigate, but it's not the report's job to surface that.
+    """Count `[ERROR]`-tagged lines within `days` of `now` across the active
+    log and its rotated `.1` sibling.
+
+    The hook tags each line with INFO or ERROR; only ERROR is counted so
+    informational notices (skips, dedupes, pricing fallbacks) don't fire
+    false-positive warnings. Returns 0 on any failure — the health signal
+    must never raise.
     """
     if log_path is None:
         return 0
     base = now if now is not None else datetime.now(timezone.utc)
     cutoff = base - timedelta(days=days)
+    # Include the rotated generation so post-rotation gaps don't hide errors.
+    paths = [log_path, Path(str(log_path) + ".1")]
     count = 0
-    try:
-        with log_path.open("r", encoding="utf-8", errors="replace") as f:
-            data = f.read(_LOG_READ_CAP)
-    except (FileNotFoundError, OSError):
-        return 0
-    for line in data.splitlines():
-        m = _LOG_LINE_TS.match(line)
-        if not m:
+    for p in paths:
+        text = _read_log_tail(p, _LOG_READ_CAP)
+        if not text:
             continue
-        try:
-            dt = datetime.fromisoformat(m.group(1).replace("Z", "+00:00"))
-        except ValueError:
-            continue
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        if dt >= cutoff:
-            count += 1
+        for line in text.splitlines():
+            m = _LOG_LINE_FORMAT.match(line)
+            if not m or m.group("level") != "ERROR":
+                continue
+            try:
+                dt = datetime.fromisoformat(m.group(1).replace("Z", "+00:00"))
+            except ValueError:
+                continue
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            if dt >= cutoff:
+                count += 1
     return count

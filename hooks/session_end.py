@@ -92,18 +92,32 @@ PRICING_CANDIDATES = [
 SKIP_REASONS = {"compact", "clear", "prompt_input_submit"}
 
 
-def log(msg: str) -> None:
+def _log_with_level(level: str, msg: str) -> None:
     try:
         METRICS_DIR.mkdir(parents=True, exist_ok=True)
         try:
-            if LOG_PATH.stat().st_size > LOG_MAX_BYTES:
+            if LOG_PATH.stat().st_size >= LOG_MAX_BYTES:
                 os.replace(LOG_PATH, LOG_PATH_PREV)
         except FileNotFoundError:
             pass
         with LOG_PATH.open("a") as f:
-            f.write(f"[{datetime.now(timezone.utc).isoformat()}] {msg}\n")
+            f.write(f"[{datetime.now(timezone.utc).isoformat()}] [{level}] {msg}\n")
     except Exception:
         pass
+
+
+def log(msg: str) -> None:
+    """Informational. Recorded in hook.log for debugging but NOT counted by
+    /analyze-metrics' 'recent hook errors' health signal — used for normal
+    flow events (skips, dedupes, pricing fallbacks)."""
+    _log_with_level("INFO", msg)
+
+
+def log_error(msg: str) -> None:
+    """Real degradation: parse crash, IO/fork failure, corrupt input.
+    Tagged so the report can surface 'N hook errors in last 7 days' without
+    false positives from informational notices."""
+    _log_with_level("ERROR", msg)
 
 
 # v5. Project-identity helpers. Captured per-session in run_worker so reports
@@ -163,7 +177,7 @@ def _capture_git_metadata(cwd: str) -> tuple[str, str]:
     except FileNotFoundError:
         return "", ""
     except (subprocess.TimeoutExpired, OSError) as e:
-        log(f"git rev-parse failed at {cwd}: {e}")
+        log_error(f"git rev-parse failed at {cwd}: {e}")
         return "", ""
     if proc.returncode != 0:
         return "", ""
@@ -178,7 +192,7 @@ def _capture_git_metadata(cwd: str) -> tuple[str, str]:
     except FileNotFoundError:
         return git_root, ""
     except (subprocess.TimeoutExpired, OSError) as e:
-        log(f"git config failed at {git_root}: {e}")
+        log_error(f"git config failed at {git_root}: {e}")
         return git_root, ""
     if proc2.returncode != 0:
         return git_root, ""
@@ -191,7 +205,7 @@ def load_pricing() -> dict:
             try:
                 return json.loads(candidate.read_text())
             except Exception as e:
-                log(f"pricing load failed at {candidate}: {e}")
+                log_error(f"pricing load failed at {candidate}: {e}")
     log("pricing config not found; cost will be null")
     return {}
 
@@ -468,7 +482,7 @@ def _session_already_recorded(session_id: str) -> bool:
                 if row.get("session_id") == session_id:
                     return True
     except Exception as e:
-        log(f"dedupe scan failed: {e}")
+        log_error(f"dedupe scan failed: {e}")
     return False
 
 
@@ -528,7 +542,7 @@ def run_worker(payload: dict) -> None:
     try:
         parsed = parse_transcript(tp)
     except Exception as e:
-        log(f"transcript parse crashed: {e}\n{traceback.format_exc()}")
+        log_error(f"transcript parse crashed: {e}\n{traceback.format_exc()}")
         parsed = {"error": "parse_crash"}
 
     if "error" in parsed:
@@ -576,7 +590,7 @@ def _detach_and_run(payload: dict) -> None:
     try:
         pid = os.fork()
     except OSError as e:
-        log(f"fork failed, running synchronously: {e}")
+        log_error(f"fork failed, running synchronously: {e}")
         run_worker(payload)
         return
 
@@ -617,7 +631,7 @@ def _detach_and_run(payload: dict) -> None:
     try:
         run_worker(payload)
     except Exception as e:
-        log(f"async worker crashed: {e}\n{traceback.format_exc()}")
+        log_error(f"async worker crashed: {e}\n{traceback.format_exc()}")
     finally:
         os._exit(0)
 
@@ -627,7 +641,7 @@ def main() -> int:
         raw = sys.stdin.read()
         payload = json.loads(raw) if raw.strip() else {}
     except Exception as e:
-        log(f"invalid stdin: {e}")
+        log_error(f"invalid stdin: {e}")
         return 0
 
     if payload.get("hook_event_name") and payload["hook_event_name"] != "SessionEnd":
@@ -672,5 +686,5 @@ if __name__ == "__main__":
     except SystemExit:
         raise
     except Exception as e:
-        log(f"fatal: {e}\n{traceback.format_exc()}")
+        log_error(f"fatal: {e}\n{traceback.format_exc()}")
         sys.exit(0)

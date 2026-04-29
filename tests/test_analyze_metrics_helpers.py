@@ -376,32 +376,94 @@ class TestRecentLogErrors(unittest.TestCase):
             0,
         )
 
-    def test_counts_lines_within_window(self):
+    def test_counts_error_lines_within_window(self):
         recent_a = (FROZEN_NOW - timedelta(hours=1)).isoformat()
         recent_b = (FROZEN_NOW - timedelta(days=2)).isoformat()
         old = (FROZEN_NOW - timedelta(days=30)).isoformat()
         self.log_path.write_text(
-            f"[{recent_a}] boom\n"
-            f"[{recent_b}] fizz\n"
-            f"[{old}] ancient\n"
+            f"[{recent_a}] [ERROR] boom\n"
+            f"[{recent_b}] [ERROR] fizz\n"
+            f"[{old}] [ERROR] ancient\n"
         )
         self.assertEqual(
             h._recent_log_errors(self.log_path, days=7, now=FROZEN_NOW),
             2,
         )
 
+    def test_info_lines_are_not_counted(self):
+        # Severity filtering is the whole point: INFO entries (skips, dedupes,
+        # pricing fallbacks) must NOT fire the 'recent hook errors' warning.
+        recent = (FROZEN_NOW - timedelta(hours=1)).isoformat()
+        self.log_path.write_text(
+            f"[{recent}] [INFO] using _default pricing for foo\n"
+            f"[{recent}] [INFO] skip: ghost session\n"
+            f"[{recent}] [ERROR] real failure\n"
+        )
+        self.assertEqual(
+            h._recent_log_errors(self.log_path, days=7, now=FROZEN_NOW),
+            1,
+        )
+
+    def test_legacy_untagged_lines_ignored(self):
+        # Pre-tag lines (logs that straddle the upgrade) lack a level group
+        # and must NOT count — better to under-report once than cry wolf.
+        recent = (FROZEN_NOW - timedelta(hours=1)).isoformat()
+        self.log_path.write_text(
+            f"[{recent}] legacy untagged line\n"
+            f"[{recent}] [ERROR] modern tagged line\n"
+        )
+        self.assertEqual(
+            h._recent_log_errors(self.log_path, days=7, now=FROZEN_NOW),
+            1,
+        )
+
     def test_malformed_lines_are_ignored_silently(self):
         recent = (FROZEN_NOW - timedelta(hours=1)).isoformat()
         self.log_path.write_text(
             "no timestamp prefix at all\n"
-            f"[not-an-iso-date] junk\n"
-            f"[{recent}] real one\n"
+            f"[not-an-iso-date] [ERROR] junk\n"
+            f"[{recent}] [ERROR] real one\n"
             "[] empty bracket\n"
         )
         self.assertEqual(
             h._recent_log_errors(self.log_path, days=7, now=FROZEN_NOW),
             1,
         )
+
+    def test_rotated_log_is_also_scanned(self):
+        # Right after a rotation, recent ERROR lines live in hook.log.1 — the
+        # health signal must not blink to 0 just because the file boundary moved.
+        recent = (FROZEN_NOW - timedelta(hours=1)).isoformat()
+        rotated = self.tmp / "hook.log.1"
+        rotated.write_text(f"[{recent}] [ERROR] failure in rotated file\n")
+        # Active log has only an INFO; without rotated scan, count would be 0.
+        self.log_path.write_text(f"[{recent}] [INFO] benign skip\n")
+        self.assertEqual(
+            h._recent_log_errors(self.log_path, days=7, now=FROZEN_NOW),
+            1,
+        )
+
+    def test_oversized_log_tail_is_read(self):
+        # Files larger than the cap are tail-read so the most recent entries
+        # remain visible; a runaway pre-rotation log must not hide errors.
+        recent = (FROZEN_NOW - timedelta(hours=1)).isoformat()
+        original_cap = h._LOG_READ_CAP
+        try:
+            h._LOG_READ_CAP = 4 * 1024  # tiny for the test
+            padding = "[2020-01-01T00:00:00+00:00] [INFO] " + "x" * 80
+            tail = f"[{recent}] [ERROR] recent failure"
+            body_lines = [padding] * 200 + [tail]
+            self.log_path.write_text("\n".join(body_lines) + "\n")
+            self.assertGreater(
+                self.log_path.stat().st_size, h._LOG_READ_CAP,
+                "fixture must exceed the cap to exercise tail reading",
+            )
+            self.assertEqual(
+                h._recent_log_errors(self.log_path, days=7, now=FROZEN_NOW),
+                1,
+            )
+        finally:
+            h._LOG_READ_CAP = original_cap
 
     def test_returns_zero_on_unreadable_path(self):
         # Directory in place of a file → open() raises IsADirectoryError /

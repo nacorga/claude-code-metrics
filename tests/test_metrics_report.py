@@ -231,6 +231,52 @@ class TestEscaping(unittest.TestCase):
         finally:
             fx.cleanup()
 
+    def test_dict_keys_from_user_env_are_escaped(self):
+        # tool_distribution / subagent_invocations / subagent_stats keys are
+        # captured verbatim from the user's environment. Custom MCP servers
+        # and user-defined subagent types could produce names with HTML
+        # special chars; the renderer must escape them on every interpolation.
+        rows = [
+            _make_row(
+                session_id="evil-keys",
+                ts=_ts(1),
+                model="<img src=x onerror=alert(1)>",
+                tool_distribution={"<malicious-tool>": 5, "Read": 1},
+                subagent_invocations={"<evil-subagent>": 3},
+                subagent_stats={
+                    "<evil-subagent>": {
+                        "count": 3, "return_chars_total": 600,
+                        "duration_s_total": 1.5, "errors": 0,
+                        "max_return_chars": 300, "max_duration_s": 1.0,
+                    },
+                },
+            ),
+        ]
+        retro = [
+            {"schema_version": 1, "session_id": "evil-keys", "ts": _ts(1),
+             "task_outcome": "<bad>outcome</bad>",
+             "skill_trigger_accuracy": "<bad>",
+             "correction_rate": 5},
+        ]
+        fx = _Fixture(rows, retro_rows=retro)
+        try:
+            rc, html, _ = fx.run("--since", "all")
+            self.assertEqual(rc, 0)
+            # No raw HTML from any user-controlled string survives the render.
+            for raw in (
+                "<img src=x onerror=alert(1)>",
+                "<malicious-tool>",
+                "<evil-subagent>",
+                "<bad>outcome</bad>",
+            ):
+                self.assertNotIn(raw, html, f"unescaped: {raw}")
+            # Escaped forms must be present somewhere in the document.
+            self.assertIn("&lt;malicious-tool&gt;", html)
+            self.assertIn("&lt;evil-subagent&gt;", html)
+            self.assertIn("&lt;img src=x", html)
+        finally:
+            fx.cleanup()
+
 
 class TestSecurityContract(unittest.TestCase):
     """The HTML must be safe to open offline from file:// — fully self-
@@ -336,8 +382,11 @@ class TestSchemaMix(unittest.TestCase):
             self.assertIn("foo", html)
             # v4 surface section: only v5 row has subagent_stats.
             self.assertIn("Subagent return surface", html)
-            # The v3-only fallback section should not appear when v4 rows exist.
-            # (We render that section only when v4_rows == 0.)
+            # Even when v4 data is present the static TOC anchor must still
+            # land on a real section — render emits a placeholder pointing
+            # the reader at the richer v4+ sections instead of nothing.
+            self.assertIn('id="subagent-invocations"', html)
+            self.assertIn("covered by the v4+ subagent sections", html)
             # Check the v4 surface has Explore listed.
             self.assertIn("Explore", html)
         finally:
@@ -469,8 +518,8 @@ class TestHealthSignal(unittest.TestCase):
             now = datetime.now(timezone.utc)
             recent = (now - timedelta(hours=2)).isoformat()
             self._write_log(fx, [
-                f"[{recent}] hook crashed parsing payload",
-                f"[{recent}] another failure",
+                f"[{recent}] [ERROR] hook crashed parsing payload",
+                f"[{recent}] [ERROR] another failure",
             ])
             rc, html, _ = fx.run("--since", "all")
             self.assertEqual(rc, 0)
@@ -480,17 +529,129 @@ class TestHealthSignal(unittest.TestCase):
         finally:
             fx.cleanup()
 
+    def test_info_lines_do_not_warn(self):
+        # Regression guard: pricing-fallback / ghost-skip / dedupe entries
+        # are tagged [INFO] and must not count toward the health warning,
+        # otherwise users on a default install see false-positive errors
+        # every session.
+        rows = [_make_row(session_id="s1", ts=_ts(0), cost_usd=0.10)]
+        fx = _Fixture(rows)
+        try:
+            now = datetime.now(timezone.utc)
+            recent = (now - timedelta(hours=2)).isoformat()
+            self._write_log(fx, [
+                f"[{recent}] [INFO] using _default pricing for foo",
+                f"[{recent}] [INFO] skip: ghost session",
+                f"[{recent}] [INFO] dedupe: session_id abc already recorded",
+            ])
+            rc, html, _ = fx.run("--since", "all")
+            self.assertEqual(rc, 0)
+            self.assertIn("hook errors (7d): 0", html)
+            self.assertNotIn('<p class="health-warning">', html)
+        finally:
+            fx.cleanup()
+
     def test_old_log_lines_outside_window_dont_warn(self):
         rows = [_make_row(session_id="s1", ts=_ts(0), cost_usd=0.10)]
         fx = _Fixture(rows)
         try:
             now = datetime.now(timezone.utc)
             old = (now - timedelta(days=30)).isoformat()
-            self._write_log(fx, [f"[{old}] long-ago crash"])
+            self._write_log(fx, [f"[{old}] [ERROR] long-ago crash"])
             rc, html, _ = fx.run("--since", "all")
             self.assertEqual(rc, 0)
             self.assertIn("hook errors (7d): 0", html)
             self.assertNotIn('<p class="health-warning">', html)
+        finally:
+            fx.cleanup()
+
+    def test_rotated_log_errors_are_counted(self):
+        # The active log might be empty right after rotation; the recent
+        # errors must still surface from hook.log.1.
+        rows = [_make_row(session_id="s1", ts=_ts(0), cost_usd=0.10)]
+        fx = _Fixture(rows)
+        try:
+            now = datetime.now(timezone.utc)
+            recent = (now - timedelta(hours=2)).isoformat()
+            (fx.metrics_dir / "hook.log").write_text(
+                f"[{recent}] [INFO] benign skip\n"
+            )
+            (fx.metrics_dir / "hook.log.1").write_text(
+                f"[{recent}] [ERROR] failure pre-rotation\n"
+            )
+            rc, html, _ = fx.run("--since", "all")
+            self.assertEqual(rc, 0)
+            self.assertIn("hook errors (7d): 1", html)
+            self.assertIn('<p class="health-warning">', html)
+        finally:
+            fx.cleanup()
+
+
+class TestTocAnchors(unittest.TestCase):
+    """The static TOC links must always resolve. Adding a new section anchor
+    here without rendering it would give the user a dead link — pin every
+    anchor to its rendered section."""
+
+    def test_every_toc_anchor_has_a_rendered_section(self):
+        rows = [_make_row(ts=_ts(1))]
+        fx = _Fixture(rows)
+        try:
+            rc, html, _ = fx.run("--since", "all")
+            self.assertEqual(rc, 0)
+            # Pull every #fragment used in TOC links and assert there is a
+            # matching id on a section element.
+            anchors = set(re.findall(r'<a href="#([\w-]+)"', html))
+            ids = set(re.findall(r'<section id="([\w-]+)"', html))
+            missing = anchors - ids - {"hero"}  # hero anchor lives on a different element
+            self.assertFalse(
+                missing,
+                f"TOC anchors point at sections that were not rendered: {sorted(missing)}",
+            )
+        finally:
+            fx.cleanup()
+
+
+class TestProjectFilterScope(unittest.TestCase):
+    """`--project all` must be treated as an explicit (likely empty) filter,
+    not as the unfiltered default — otherwise the hero header lies."""
+
+    def test_no_flag_says_all_time(self):
+        rows = [_make_row(ts=_ts(1))]
+        fx = _Fixture(rows)
+        try:
+            rc, html, _ = fx.run("--since", "all")
+            self.assertEqual(rc, 0)
+            self.assertIn("all-time:", html)
+            self.assertNotIn("all-time (this project)", html)
+            self.assertIn("project: all", html)
+        finally:
+            fx.cleanup()
+
+    def test_explicit_project_shows_this_project_scope(self):
+        rows = [_make_row(ts=_ts(1), git_remote_origin="github.com/me/foo",
+                           git_root="/x/foo", cwd="/x/foo")]
+        fx = _Fixture(rows)
+        try:
+            rc, html, _ = fx.run("--since", "all", "--project", "foo")
+            self.assertEqual(rc, 0)
+            self.assertIn("all-time (this project)", html)
+            self.assertIn("project: foo", html)
+        finally:
+            fx.cleanup()
+
+    def test_project_all_is_treated_as_explicit_filter(self):
+        # Edge case: user types `--project all`. The literal string is the
+        # filter, not the "no filter" sentinel. The header must reflect that
+        # so it is not silently misleading; no rows match → friendly empty.
+        rows = [_make_row(ts=_ts(1), git_remote_origin="github.com/me/foo",
+                           git_root="/x/foo", cwd="/x/foo")]
+        fx = _Fixture(rows)
+        try:
+            rc, html, _ = fx.run("--since", "all", "--project", "all")
+            self.assertEqual(rc, 0)
+            self.assertIn("all-time (this project)", html)
+            # The displayed filter is the literal value the user passed.
+            self.assertIn("project: all", html)
         finally:
             fx.cleanup()
 

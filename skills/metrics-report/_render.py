@@ -58,19 +58,33 @@ def _resolve_skill_dir(filename: str) -> Path:
     )
 
 
+def _import_from(d: Path, mod_name: str):
+    """Import `mod_name` from `d`, then immediately clean up sys.path.
+
+    Avoids leaking the analyze-metrics skill dir onto sys.path for the rest
+    of the process — it would otherwise shadow any future `_helpers` /
+    `_aggregate` imports made by callers that embed this module.
+    """
+    inserted = str(d)
+    sys.path.insert(0, inserted)
+    try:
+        return __import__(mod_name)
+    finally:
+        try:
+            sys.path.remove(inserted)
+        except ValueError:
+            pass
+
+
 def _load_helpers():
-    d = _resolve_skill_dir("_helpers.py")
-    sys.path.insert(0, str(d))
-    import _helpers  # type: ignore
-    return _helpers
+    return _import_from(_resolve_skill_dir("_helpers.py"), "_helpers")
 
 
 def _load_aggregate():
-    # _aggregate imports from _helpers, so put its dir on sys.path first.
-    d = _resolve_skill_dir("_aggregate.py")
-    sys.path.insert(0, str(d))
-    import _aggregate  # type: ignore
-    return _aggregate
+    # _aggregate imports from _helpers; loading helpers first puts the module
+    # in sys.modules so the inner `from _helpers import ...` resolves from
+    # cache without needing sys.path to stay polluted.
+    return _import_from(_resolve_skill_dir("_aggregate.py"), "_aggregate")
 
 
 # Lazy-loaded on first call to main(), so importing this module for tests
@@ -496,9 +510,9 @@ header.hero .meta + .meta {
 header.hero .health-warning {
   margin: var(--sp-2) 0 0;
   padding: var(--sp-2) var(--sp-3);
-  border-left: 3px solid #b00020;
-  background: rgba(176, 0, 32, 0.06);
-  color: #b00020;
+  border-left: 3px solid var(--color-danger);
+  background: var(--color-danger-soft);
+  color: var(--color-danger);
   font-family: var(--font-mono);
   font-size: var(--text-sm);
   font-weight: 600;
@@ -836,7 +850,7 @@ def _render_hero(meta: dict, agg: dict, all_time: dict) -> str:
     ])
 
     schema_str = ", ".join(f"v{v}" for v in meta["schema_versions"]) or "—"
-    scope = "all-time" if meta["project_filter"] == "all" else "all-time (this project)"
+    scope = "all-time (this project)" if meta.get("project_filter_active") else "all-time"
     all_time_str = (
         f'{scope}: {all_time["total_sessions"]} sessions, '
         f'{_fmt_money(all_time["total_cost"])} total'
@@ -848,7 +862,7 @@ def _render_hero(meta: dict, agg: dict, all_time: dict) -> str:
         f'Last session: {_esc(last_age)}  ·  hook errors (7d): {_esc(str(n_err))}'
     )
     warning_html = (
-        f'<p class="health-warning">⚠ {n_err} hook errors in the last 7 days '
+        f'<p class="health-warning">⚠ {_esc(n_err)} hook errors in the last 7 days '
         '— check <code>~/.claude/metrics/hook.log</code></p>'
     ) if n_err > 0 else ''
 
@@ -1213,9 +1227,15 @@ def _render_subagent_cheap(agg: dict) -> str:
 
 
 def _render_subagent_invocations(agg: dict) -> str:
-    # Only render if we have v3 invocations but no v4 surface (avoids dup)
+    # Always emit the section so the static TOC anchor never dangles; when
+    # v4 rows exist we render a placeholder pointing readers at the richer
+    # surface/slow/cheap sections instead of duplicating the count.
     if agg["v4_rows"] > 0:
-        return ""
+        return _section(
+            "subagent-invocations", "Subagent invocations (v3+)",
+            _empty("covered by the v4+ subagent sections above — "
+                   "see return surface, slowest, and cheap calls"),
+        )
     if agg["v3_sub_rows"] == 0:
         return _section(
             "subagent-invocations", "Subagent invocations (v3+)",
@@ -1469,12 +1489,17 @@ def _build_meta(args, n_sessions: int, err_count: int,
                 retro_count: int, ts_range: tuple[str, str] | None,
                 source_path: Path, schema_versions: list,
                 auto_all: list[dict], log_path: Path) -> dict:
-    project_filter = (args.project or "").strip() or "all"
+    # Distinguish "no filter" (sentinel "all") from "user explicitly passed
+    # --project <something>". Otherwise `--project all` would conflate both
+    # in the hero header even though the row filter is real.
+    project_arg = (args.project or "").strip()
+    project_filter_active = bool(project_arg)
+    project_filter = project_arg if project_filter_active else "all"
     cmd_parts = ["python3 _render.py"]
     if args.since:
         cmd_parts.append(f"--since {args.since}")
-    if args.project:
-        cmd_parts.append(f"--project {args.project}")
+    if project_arg:
+        cmd_parts.append(f"--project {project_arg}")
     if args.output:
         cmd_parts.append(f"--output {args.output}")
     return {
@@ -1484,6 +1509,7 @@ def _build_meta(args, n_sessions: int, err_count: int,
         "ts_range": ts_range,
         "window_label": _h._window_label(args.since, default_days=30),
         "project_filter": project_filter,
+        "project_filter_active": project_filter_active,
         "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "command": " ".join(cmd_parts),
         "source_path": source_path,
@@ -1541,9 +1567,13 @@ def main(argv: list[str] | None = None) -> int:
     err_count = len(err_rows)
 
     retro = _read_jsonl(retro_path)
+    # O(N+M) membership: retro/auto can both run into the thousands; the
+    # nested any() form was O(N*M) and slowed materially as files grew.
+    retro_session_ids = {
+        r.get("session_id") for r in retro if r.get("session_id")
+    }
     retro_count = sum(
-        1 for a in auto
-        if any(r.get("session_id") == a.get("session_id") for r in retro)
+        1 for a in auto if a.get("session_id") in retro_session_ids
     )
 
     pricing = _load_pricing(metrics_dir)
