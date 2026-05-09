@@ -224,6 +224,12 @@ def aggregate(auto: list[dict], retro_by_id: dict[str, dict],
     # at least 30 calls total. Heavy single-tool workflows are candidates
     # for a script or skill; surfaced for /recommend's pattern.tool_dominance
     # rule. Uncapped (per-session list, naturally bounded by the window).
+    #
+    # Uses `sum(td.values())` rather than `tool_calls_total` so the fraction
+    # math stays internally consistent with the `tool_distribution` map we
+    # rank against. The hook builds both from the same Counter so the two
+    # always agree in practice; using the distribution sum makes that
+    # invariant local to this loop instead of cross-field.
     tool_dominance_sessions: list[dict] = []
     for a in auto:
         td = a.get("tool_distribution") or {}

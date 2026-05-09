@@ -232,6 +232,60 @@ class TestNoData(unittest.TestCase):
             fx.cleanup()
 
 
+class TestMinEvidenceFlag(unittest.TestCase):
+    """`--min-evidence` is the same knob `/recommend` exposes; it must thread
+    through the HTML report so users aren't stuck on the default of 3."""
+
+    def _err_rows(self, n: int) -> list[dict]:
+        # tool_errors_count >= 7 is the friction.tool_errors threshold (p90).
+        return [
+            _make_row(session_id=f"e{i}", ts=_ts(2),
+                      tool_errors_count=10)
+            for i in range(n)
+        ]
+
+    def test_default_threshold_suppresses_below_three_sessions(self):
+        # 2 sessions above the per-rule threshold; min-evidence default = 3
+        # → friction.tool_errors should NOT fire.
+        fx = _Fixture(self._err_rows(2))
+        try:
+            rc, html, _ = fx.run("--since", "all")
+            self.assertEqual(rc, 0)
+            self.assertNotIn("friction.tool_errors", html)
+        finally:
+            fx.cleanup()
+
+    def test_min_evidence_one_surfaces_weaker_signal(self):
+        # Same 2 sessions, but --min-evidence 1 should let it fire.
+        fx = _Fixture(self._err_rows(2))
+        try:
+            rc, html, _ = fx.run("--since", "all", "--min-evidence", "1")
+            self.assertEqual(rc, 0)
+            self.assertIn("friction.tool_errors", html)
+        finally:
+            fx.cleanup()
+
+    def test_non_default_min_evidence_appears_in_command_echo(self):
+        # The footer's command echo helps users reproduce the exact slice.
+        fx = _Fixture(self._err_rows(1))
+        try:
+            rc, html, _ = fx.run("--since", "all", "--min-evidence", "5")
+            self.assertEqual(rc, 0)
+            self.assertIn("--min-evidence 5", html)
+        finally:
+            fx.cleanup()
+
+    def test_default_min_evidence_omitted_from_command_echo(self):
+        # Using the default value should keep the command echo clean.
+        fx = _Fixture(self._err_rows(1))
+        try:
+            rc, html, _ = fx.run("--since", "all")
+            self.assertEqual(rc, 0)
+            self.assertNotIn("--min-evidence", html)
+        finally:
+            fx.cleanup()
+
+
 class TestEscaping(unittest.TestCase):
 
     def test_html_special_chars_escaped(self):

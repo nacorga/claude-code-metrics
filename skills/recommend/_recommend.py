@@ -217,11 +217,16 @@ def _rule_friction_over_steering(agg: dict, rows: list[dict],
 
 def _rule_agent_error_rate(agg: dict, rows: list[dict], min_evidence: int):
     surface = agg.get("surface", {})
+    # `min_evidence` tightens (never loosens) the calibrated invocation floor
+    # — keeps `--min-evidence N` consistent with rules like
+    # `friction.tool_errors`, while preserving the noise-floor that protects
+    # against fluky n=1 ratios.
+    min_count = max(_AGENT_ERROR_MIN_INVOCATIONS, min_evidence)
     flagged = []
     for name, s in surface.items():
         count = s.get("count", 0)
         errors = s.get("errors", 0)
-        if count < _AGENT_ERROR_MIN_INVOCATIONS:
+        if count < min_count:
             continue
         rate = errors / count if count else 0
         if rate >= _AGENT_ERROR_RATE:
@@ -266,10 +271,14 @@ def _rule_agent_error_rate(agg: dict, rows: list[dict], min_evidence: int):
 def _rule_agent_return_too_short(agg: dict, rows: list[dict],
                                  min_evidence: int):
     surface = agg.get("surface", {})
+    # See `_rule_agent_error_rate`: tighten-only floor so `--min-evidence`
+    # stays consistent without dropping below the calibrated 10-invocation
+    # threshold that keeps the average stable.
+    min_count = max(_AGENT_SHORT_RETURN_MIN_INVOCATIONS, min_evidence)
     flagged = []
     for name, s in surface.items():
         count = s.get("count", 0)
-        if count < _AGENT_SHORT_RETURN_MIN_INVOCATIONS:
+        if count < min_count:
             continue
         avg = (s.get("return_chars", 0) / count) if count else 0
         if avg < _AGENT_SHORT_RETURN_AVG:
@@ -396,9 +405,13 @@ def _rule_project_no_claude_md(agg: dict, rows: list[dict],
         gr = r.get("git_root")
         if gr and isinstance(gr, str) and gr.strip():
             git_roots[k] = gr.strip()
+    # Tighten-only floor: `--min-evidence` may raise the session bar but
+    # never below the calibrated "high-frequency project" threshold, so
+    # CLAUDE.md nags don't fire on rarely-touched repos.
+    min_sessions = max(_PROJECT_MIN_SESSIONS, min_evidence)
     candidates = []
     for k, count in by_proj.most_common():
-        if count < _PROJECT_MIN_SESSIONS:
+        if count < min_sessions:
             break  # most_common is sorted descending; once below threshold, done
         gr = git_roots.get(k)
         if not gr:

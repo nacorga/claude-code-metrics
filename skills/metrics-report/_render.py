@@ -1446,8 +1446,12 @@ def _render_footer(meta: dict) -> str:
     )
 
 
+_DEFAULT_MIN_EVIDENCE = 3
+
+
 def render_html(auto: list[dict], retro: list[dict], pricing: dict,
-                meta: dict, all_time: dict) -> str:
+                meta: dict, all_time: dict,
+                min_evidence: int = _DEFAULT_MIN_EVIDENCE) -> str:
     retro_by_id = {r["session_id"]: r for r in retro
                    if isinstance(r, dict) and r.get("session_id")}
     if auto:
@@ -1474,7 +1478,7 @@ def render_html(auto: list[dict], retro: list[dict], pricing: dict,
         )
     else:
         total_cost_in_window = sum(agg["costs"]) if agg["costs"] else 0.0
-        recs = _reco.evaluate(agg, auto, min_evidence=3)
+        recs = _reco.evaluate(agg, auto, min_evidence=min_evidence)
         body_parts.extend([
             _render_recommendations(recs),
             _render_trend(agg["by_week"]),
@@ -1542,6 +1546,8 @@ def _build_meta(args, n_sessions: int, err_count: int,
         cmd_parts.append(f"--project {project_arg}")
     if args.output:
         cmd_parts.append(f"--output {args.output}")
+    if getattr(args, "min_evidence", _DEFAULT_MIN_EVIDENCE) != _DEFAULT_MIN_EVIDENCE:
+        cmd_parts.append(f"--min-evidence {args.min_evidence}")
     # Single source of "now" for the report. Production passes None →
     # real clock (fresh value at every call site, fine because the skew
     # is sub-millisecond). Tests pass a fixed datetime so generated_at,
@@ -1594,7 +1600,15 @@ def main(argv: list[str] | None = None,
                         help="Output path (default: $CLAUDE_HOME/metrics/report.html).")
     parser.add_argument("--metrics-dir", default=None,
                         help="Override the metrics directory (advanced).")
+    parser.add_argument("--min-evidence", type=int,
+                        default=_DEFAULT_MIN_EVIDENCE,
+                        help=(
+                            "Minimum supporting sessions per recommendation "
+                            f"rule (default: {_DEFAULT_MIN_EVIDENCE}; lower "
+                            "values surface weaker signals)."
+                        ))
     args = parser.parse_args(argv)
+    args.min_evidence = max(1, int(args.min_evidence))
 
     metrics_dir = Path(args.metrics_dir) if args.metrics_dir else (_claude_home() / "metrics")
     auto_path = metrics_dir / "auto.jsonl"
@@ -1654,7 +1668,8 @@ def main(argv: list[str] | None = None,
         "total_cost": sum(all_time_costs) if all_time_costs else 0.0,
     }
 
-    html_doc = render_html(auto, retro, pricing, meta, all_time)
+    html_doc = render_html(auto, retro, pricing, meta, all_time,
+                           min_evidence=args.min_evidence)
 
     out_path = Path(args.output) if args.output else (metrics_dir / "report.html")
     out_path.parent.mkdir(parents=True, exist_ok=True)

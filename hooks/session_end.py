@@ -75,12 +75,12 @@ CORRECTION_KEYWORDS = (
     "doesnt work",
     "not what i asked",
     "not what i wanted",
-    # Spanish (anchored phrases where ambiguous)
+    # Spanish (anchored phrases where ambiguous). `incorrecto`/`incorrecta`
+    # are intentionally omitted — the English `incorrect` above already
+    # matches them as substrings, so listing both is dead weight.
     "deshaz",
     "revierte",
     "rehaz",
-    "incorrecto",
-    "incorrecta",
     "no es eso",
     "no es lo que",
     "vuelve atrás",

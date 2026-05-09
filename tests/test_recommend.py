@@ -14,6 +14,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 REPO = Path(__file__).resolve().parent.parent
 SHARED_DIR = REPO / "skills" / "analyze-metrics"
@@ -199,6 +200,23 @@ class TestRuleAgentErrorRate(unittest.TestCase):
         rec = r._rule_agent_error_rate(_agg(rows), rows, min_evidence=3)
         self.assertIsNone(rec)
 
+    def test_min_evidence_tightens_invocation_floor(self):
+        # 5 invocations clears the calibrated floor (3) but not
+        # min_evidence=10 → rule must suppress, proving the CLI knob has
+        # teeth on this rule too.
+        rows = [_row(subagent_stats={
+            "ux-ui-reviewer": {"count": 5, "return_chars_total": 10000,
+                               "duration_s_total": 25.0, "errors": 2,
+                               "max_return_chars": 3000,
+                               "max_duration_s": 8.0},
+        })]
+        self.assertIsNotNone(
+            r._rule_agent_error_rate(_agg(rows), rows, min_evidence=3),
+        )
+        self.assertIsNone(
+            r._rule_agent_error_rate(_agg(rows), rows, min_evidence=10),
+        )
+
 
 # ---------------------------------------------------------------------------
 # agent.return_too_short — info severity, avg < 1500 with >= 10 invocations.
@@ -228,6 +246,23 @@ class TestRuleAgentReturnTooShort(unittest.TestCase):
         })]
         rec = r._rule_agent_return_too_short(_agg(rows), rows, min_evidence=3)
         self.assertIsNone(rec)
+
+    def test_min_evidence_tightens_invocation_floor(self):
+        # 12 invocations clears the calibrated floor (10); raising
+        # min_evidence to 15 should suppress.
+        rows = [_row(subagent_stats={
+            "summarizer": {
+                "count": 12, "return_chars_total": 12 * 800,
+                "duration_s_total": 24.0, "errors": 0,
+                "max_return_chars": 1200, "max_duration_s": 3.0,
+            },
+        })]
+        self.assertIsNotNone(
+            r._rule_agent_return_too_short(_agg(rows), rows, min_evidence=3),
+        )
+        self.assertIsNone(
+            r._rule_agent_return_too_short(_agg(rows), rows, min_evidence=15),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -350,6 +385,23 @@ class TestRuleProjectNoClaudeMd(unittest.TestCase):
         rec = r._rule_project_no_claude_md(_agg(rows), rows, min_evidence=3)
         self.assertIsNone(rec)
 
+    def test_min_evidence_tightens_session_floor(self):
+        # 12 sessions clears the calibrated floor (10) at min_evidence=3
+        # but not at min_evidence=20.
+        with tempfile.TemporaryDirectory() as td:
+            git_root = Path(td) / "myrepo"
+            git_root.mkdir()
+            rows = [_row(session_id=f"r{i}", git_root=str(git_root),
+                         git_remote_origin="github.com/me/myrepo")
+                    for i in range(12)]
+            self.assertIsNotNone(
+                r._rule_project_no_claude_md(_agg(rows), rows, min_evidence=3),
+            )
+            self.assertIsNone(
+                r._rule_project_no_claude_md(_agg(rows), rows,
+                                             min_evidence=20),
+            )
+
 
 # ---------------------------------------------------------------------------
 # evaluate() — integration: runs every rule, sorts by severity, swallows
@@ -394,19 +446,17 @@ class TestEvaluatePipeline(unittest.TestCase):
 
     def test_buggy_rule_does_not_break_others(self):
         # Inject a temporarily-broken rule into _RULES; evaluate() must
-        # swallow the exception and still emit the others.
-        original = list(r._RULES)
-        try:
-            def boom(agg, rows, min_evidence):
-                raise RuntimeError("simulated rule crash")
-            r._RULES.insert(0, boom)
+        # swallow the exception and still emit the others. patch.object
+        # restores the list even if the assertion raises mid-test.
+        def boom(agg, rows, min_evidence):
+            raise RuntimeError("simulated rule crash")
+
+        with patch.object(r, "_RULES", [boom, *r._RULES]):
             rows = [_row(session_id=f"e{i}", tool_errors_count=10)
                     for i in range(3)]
             recs = r.evaluate(_agg(rows), rows, min_evidence=3)
             ids = [rec.id for rec in recs]
             self.assertIn("friction.tool_errors", ids)
-        finally:
-            r._RULES[:] = original
 
 
 # ---------------------------------------------------------------------------

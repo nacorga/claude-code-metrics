@@ -19,10 +19,12 @@ Generate a single static HTML file with the same insights as `/analyze-metrics`,
 /metrics-report --project foo/bar                  # only sessions in that repo
 /metrics-report --project github.com/foo/bar       # match by full normalized origin
 /metrics-report --output ~/Desktop/report.html     # custom output path
+/metrics-report --min-evidence 5                   # stricter recommendations (≥5 supporting sessions)
+/metrics-report --min-evidence 1                   # surface even single-session signals
 /metrics-report --since 90d --project foo/bar      # combined
 ```
 
-`--since` and `--project` follow the exact same rules as `/analyze-metrics` (shared helpers): substring matches on `--project` are intentionally rejected, garbage `--since` falls back to the default 30-day window.
+`--since` and `--project` follow the exact same rules as `/analyze-metrics` (shared helpers): substring matches on `--project` are intentionally rejected, garbage `--since` falls back to the default 30-day window. `--min-evidence` controls the threshold for the embedded Recommendations section (default 3) and matches the flag exposed by `/recommend`.
 
 ## Steps
 
