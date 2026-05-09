@@ -30,31 +30,32 @@ def _claude_home() -> Path:
     return Path(os.environ.get("CLAUDE_HOME") or (Path.home() / ".claude"))
 
 
-def _resolve_skill_dir(filename: str) -> Path:
-    """Find the analyze-metrics skill directory containing `filename`.
+def _resolve_skill_dir(filename: str, skill_name: str = "analyze-metrics",
+                       env_var: str = "CCM_HELPERS_DIR") -> Path:
+    """Find a sibling skill directory containing `filename`.
 
     Resolution order:
-      1. CCM_HELPERS_DIR env var (used by tests).
-      2. Sibling skill in the repo (dev: skills/analyze-metrics next to us).
-      3. Installed skill at $CLAUDE_HOME/skills/analyze-metrics.
+      1. `env_var` env var (CCM_HELPERS_DIR for analyze-metrics, used by tests).
+      2. Sibling skill in the repo (dev: skills/<skill_name> next to us).
+      3. Installed skill at $CLAUDE_HOME/skills/<skill_name>.
 
     Fails loudly with a clear message rather than silently degrading — the
     filter and aggregation rules are load-bearing for correct numbers.
     """
     candidates = []
-    env_dir = os.environ.get("CCM_HELPERS_DIR")
+    env_dir = os.environ.get(env_var)
     if env_dir:
         candidates.append(Path(env_dir))
     here = Path(__file__).resolve().parent
-    candidates.append(here.parent / "analyze-metrics")
-    candidates.append(_claude_home() / "skills" / "analyze-metrics")
+    candidates.append(here.parent / skill_name)
+    candidates.append(_claude_home() / "skills" / skill_name)
     for cand in candidates:
         if (cand / filename).is_file():
             return cand
     raise SystemExit(
-        f"metrics-report: could not locate analyze-metrics/{filename}.\n"
+        f"metrics-report: could not locate {skill_name}/{filename}.\n"
         "Tried: " + ", ".join(str(c) for c in candidates) + "\n"
-        "Reinstall with scripts/install.sh, or set CCM_HELPERS_DIR."
+        f"Reinstall with scripts/install.sh, or set {env_var}."
     )
 
 
@@ -87,10 +88,25 @@ def _load_aggregate():
     return _import_from(_resolve_skill_dir("_aggregate.py"), "_aggregate")
 
 
+def _load_recommend():
+    # _recommend lives in the recommend skill dir; it imports _helpers from
+    # the analyze-metrics dir lazily inside its rule functions, so the
+    # caller (main) must load helpers first to populate sys.modules.
+    return _import_from(
+        _resolve_skill_dir(
+            "_recommend.py",
+            skill_name="recommend",
+            env_var="CCM_RECOMMEND_DIR",
+        ),
+        "_recommend",
+    )
+
+
 # Lazy-loaded on first call to main(), so importing this module for tests
 # without the helpers in place still works.
 _h: Any = None
 _agg: Any = None
+_reco: Any = None
 
 
 # ----------------------------------------------------------------------
@@ -774,6 +790,7 @@ footer .cmd {
 
 SECTIONS_INDEX = [
     ("hero", "Overview"),
+    ("recommendations", "Recommendations"),
     ("trend", "Cost trend"),
     ("by-model", "Cost by model"),
     ("by-project", "Cost by project"),
@@ -1343,6 +1360,22 @@ def _render_top_tools(tool_totals: dict) -> str:
     )
 
 
+def _render_recommendations(recs: list) -> str:
+    """Wrap _recommend.render_html_inner() in the section chrome the rest
+    of the report uses. Always emits the section so the static TOC anchor
+    never dangles — the empty state is rendered inside the inner HTML."""
+    return _section(
+        "recommendations",
+        "Recommendations",
+        _reco.render_html_inner(recs),
+        note=(
+            "Threshold-based heuristics: each rule fires only when there is "
+            "enough supporting evidence in the window. Absence of a "
+            "recommendation means no signal, not failure."
+        ),
+    )
+
+
 def _render_retro(agg: dict) -> str:
     by_outcome = agg["by_outcome"]
     by_model_corr = agg["by_model_corr"]
@@ -1413,8 +1446,12 @@ def _render_footer(meta: dict) -> str:
     )
 
 
+_DEFAULT_MIN_EVIDENCE = 3
+
+
 def render_html(auto: list[dict], retro: list[dict], pricing: dict,
-                meta: dict, all_time: dict) -> str:
+                meta: dict, all_time: dict,
+                min_evidence: int = _DEFAULT_MIN_EVIDENCE) -> str:
     retro_by_id = {r["session_id"]: r for r in retro
                    if isinstance(r, dict) and r.get("session_id")}
     if auto:
@@ -1426,6 +1463,10 @@ def render_html(auto: list[dict], retro: list[dict], pricing: dict,
         _render_hero(meta, agg, all_time),
     ]
     if not auto:
+        # Always render the Recommendations section so the static TOC anchor
+        # (`#recommendations` in SECTIONS_INDEX) never dangles. On an empty
+        # window the inner empty-state explains there's nothing to recommend.
+        body_parts.append(_render_recommendations([]))
         body_parts.append(
             _section(
                 "no-data",
@@ -1437,7 +1478,9 @@ def render_html(auto: list[dict], retro: list[dict], pricing: dict,
         )
     else:
         total_cost_in_window = sum(agg["costs"]) if agg["costs"] else 0.0
+        recs = _reco.evaluate(agg, auto, min_evidence=min_evidence)
         body_parts.extend([
+            _render_recommendations(recs),
             _render_trend(agg["by_week"]),
             _render_by_model(agg["by_model"]),
             _render_by_project(agg["by_proj_key"]),
@@ -1488,7 +1531,8 @@ def render_html(auto: list[dict], retro: list[dict], pricing: dict,
 def _build_meta(args, n_sessions: int, err_count: int,
                 retro_count: int, ts_range: tuple[str, str] | None,
                 source_path: Path, schema_versions: list,
-                auto_all: list[dict], log_path: Path) -> dict:
+                auto_all: list[dict], log_path: Path,
+                now: datetime | None = None) -> dict:
     # Distinguish "no filter" (sentinel "all") from "user explicitly passed
     # --project <something>". Otherwise `--project all` would conflate both
     # in the hero header even though the row filter is real.
@@ -1502,6 +1546,13 @@ def _build_meta(args, n_sessions: int, err_count: int,
         cmd_parts.append(f"--project {project_arg}")
     if args.output:
         cmd_parts.append(f"--output {args.output}")
+    if getattr(args, "min_evidence", _DEFAULT_MIN_EVIDENCE) != _DEFAULT_MIN_EVIDENCE:
+        cmd_parts.append(f"--min-evidence {args.min_evidence}")
+    # Single source of "now" for the report. Production passes None →
+    # real clock (fresh value at every call site, fine because the skew
+    # is sub-millisecond). Tests pass a fixed datetime so generated_at,
+    # the --since cutoff, and the health-signal helpers all agree.
+    _now = now if now is not None else datetime.now(timezone.utc)
     return {
         "n_sessions": n_sessions,
         "err_count": err_count,
@@ -1510,19 +1561,32 @@ def _build_meta(args, n_sessions: int, err_count: int,
         "window_label": _h._window_label(args.since, default_days=30),
         "project_filter": project_filter,
         "project_filter_active": project_filter_active,
-        "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "generated_at": _now.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "command": " ".join(cmd_parts),
         "source_path": source_path,
         "schema_versions": schema_versions,
-        "last_session_age": _h._humanize_age(_h._latest_session_ts(auto_all)),
-        "recent_hook_errors": _h._recent_log_errors(log_path, days=7),
+        "last_session_age": _h._humanize_age(
+            _h._latest_session_ts(auto_all), now=now),
+        "recent_hook_errors": _h._recent_log_errors(
+            log_path, days=7, now=now),
     }
 
 
-def main(argv: list[str] | None = None) -> int:
-    global _h, _agg
+def main(argv: list[str] | None = None,
+         now: datetime | None = None) -> int:
+    """Render the HTML report.
+
+    `now` is an optional test seam: production callers omit it and every
+    `datetime.now(timezone.utc)` site reads the real clock. Tests pass a
+    fixed datetime so time-windowed assertions (the --since cutoff, the
+    `generated_at` stamp, the health-signal helpers) all resolve against
+    the same reference. The same seam is already exposed by
+    `_helpers._parse_since` / `_humanize_age` / `_recent_log_errors`.
+    """
+    global _h, _agg, _reco
     _h = _load_helpers()
     _agg = _load_aggregate()
+    _reco = _load_recommend()
 
     parser = argparse.ArgumentParser(
         prog="metrics-report",
@@ -1536,7 +1600,15 @@ def main(argv: list[str] | None = None) -> int:
                         help="Output path (default: $CLAUDE_HOME/metrics/report.html).")
     parser.add_argument("--metrics-dir", default=None,
                         help="Override the metrics directory (advanced).")
+    parser.add_argument("--min-evidence", type=int,
+                        default=_DEFAULT_MIN_EVIDENCE,
+                        help=(
+                            "Minimum supporting sessions per recommendation "
+                            f"rule (default: {_DEFAULT_MIN_EVIDENCE}; lower "
+                            "values surface weaker signals)."
+                        ))
     args = parser.parse_args(argv)
+    args.min_evidence = max(1, int(args.min_evidence))
 
     metrics_dir = Path(args.metrics_dir) if args.metrics_dir else (_claude_home() / "metrics")
     auto_path = metrics_dir / "auto.jsonl"
@@ -1552,7 +1624,7 @@ def main(argv: list[str] | None = None) -> int:
     auto_all = [a for a in raw if not a.get("error")]
     err_rows = [a for a in raw if a.get("error")]
 
-    cutoff = _h._parse_since(args.since, default_days=30)
+    cutoff = _h._parse_since(args.since, default_days=30, now=now)
     auto = list(auto_all)
     if cutoff is not None:
         auto = [
@@ -1586,7 +1658,8 @@ def main(argv: list[str] | None = None) -> int:
 
     meta = _build_meta(args, len(auto), err_count, retro_count, ts_range,
                        auto_path, schema_versions,
-                       auto_all, metrics_dir / "hook.log")
+                       auto_all, metrics_dir / "hook.log",
+                       now=now)
 
     all_time_costs = [a.get("cost_usd") for a in auto_all
                       if a.get("cost_usd") is not None]
@@ -1595,7 +1668,8 @@ def main(argv: list[str] | None = None) -> int:
         "total_cost": sum(all_time_costs) if all_time_costs else 0.0,
     }
 
-    html_doc = render_html(auto, retro, pricing, meta, all_time)
+    html_doc = render_html(auto, retro, pricing, meta, all_time,
+                           min_evidence=args.min_evidence)
 
     out_path = Path(args.output) if args.output else (metrics_dir / "report.html")
     out_path.parent.mkdir(parents=True, exist_ok=True)

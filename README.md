@@ -39,9 +39,10 @@ And whenever you want to see your data:
 ```
 /analyze-metrics    # markdown report in the conversation
 /metrics-report     # static HTML at ~/.claude/metrics/report.html
+/recommend          # actionable next steps based on the captured signals
 ```
 
-Both accept the same `--since` and `--project` flags; `/metrics-report` writes a single self-contained HTML file (CSS + SVG inline, zero JavaScript, zero CDN) you can open with `open ~/.claude/metrics/report.html`.
+`/analyze-metrics` and `/metrics-report` are descriptive ("what happened?"); `/recommend` is prescriptive ("what should you change?") — it surfaces high-error agents, over-steered projects, model-overspend patterns, and similar from threshold rules calibrated against real session distributions. All three accept the same `--since` and `--project` flags; `/recommend` adds `--min-evidence N` to widen or tighten which rules fire. `/metrics-report` writes a single self-contained HTML file (CSS + SVG inline, zero JavaScript, zero CDN) you can open with `open ~/.claude/metrics/report.html` — its "Recommendations" section is the same engine `/recommend` uses, embedded inline.
 
 ## The four metrics
 
@@ -69,7 +70,7 @@ Every real session close appends one row with:
 - `subagent_invocations` — map of `subagent_type` → count, captured from `Agent` tool calls (e.g. `{"Explore": 5, "Plan": 1}`)
 - `user_msg_count` — user-authored text messages (excludes synthetic `tool_result`-only entries)
 - `short_user_followups_count` — user messages (after the first) under 200 chars; high counts suggest steering with short corrections rather than full prompts
-- `correction_keyword_hits` — user messages matching a conservative English keyword set (`undo`, `revert`, `rollback`, `redo`, `incorrect`, `wrong`, `broken`, `doesn't work`, `not what i asked/wanted`); heuristic, intended as a hint for `/retrospective` pre-fill, not as a strict correction rate
+- `correction_keyword_hits` — user messages matching a bilingual conservative keyword set. English entries are short unambiguous verbs (`undo`, `revert`, `rollback`, `redo`, `incorrect`, `wrong`, `broken`, `doesn't work`, `not what i asked/wanted`); Spanish entries are anchored phrases where ambiguous (`está mal`, `está roto`, `no funciona`, `deshaz`, `rehaz`, `no es lo que`, `vuelve atrás`, etc.) to avoid false positives on common short tokens. Substring match — a known limitation is that negations like `no está mal` will still match `está mal`. Heuristic, intended as a hint for `/retrospective` pre-fill, not as a strict correction rate.
 
 `/compact` and `/clear` are filtered out — only real session ends are recorded.
 
@@ -116,6 +117,7 @@ Explicitly **not** on the roadmap for v0.x:
 - SQLite / any database
 - Remote telemetry / cloud sync
 - Multi-user / team features
+- `agent.too_chatty` rule for `/recommend` — calibration on real data showed no statistical outlier (top investigative agents cluster 6k–7k chars avg); a threshold either fires on nothing or punishes agents whose long returns are intentional. A real "wasteful verbosity" signal would need return-vs-next-turn-tool-use correlation, which requires transcript-level analysis the hook deliberately avoids.
 
 The whole point is a single JSONL you own. One-shot derivative artefacts that read it (markdown via `/analyze-metrics`, static HTML via `/metrics-report`, your own notebook) are in scope; long-running processes are not.
 
@@ -125,6 +127,7 @@ Things that **are** on the table:
 - Schema validation step in the hook
 - Opt-in markdown export for sharing anonymised benchmarks
 - Additional skills: `/metrics-diff` (week over week)
+- Trend-aware recommendations (`/recommend` extension): a single generic `_rule_trend_regression` parameterised over a small metric table (tool_errors, short_user_followups, cost, subagent error rate). Self-activates once ≥5 ISO weeks each have ≥5 v3+ sessions; flags only regressions; scoped per project so deliberate strategy shifts in one repo don't trigger noise in others.
 
 ## Contributing
 

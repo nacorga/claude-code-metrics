@@ -112,7 +112,7 @@
     "correction_keyword_hits": {
       "type": "integer",
       "minimum": 0,
-      "description": "Number of user messages matching correction-style keywords (undo, revert, rollback, redo, incorrect, wrong, broken, doesn't work, not what i asked/wanted). English-only conservative set; meant for retro pre-fill, not as a strict correction rate."
+      "description": "Number of user messages matching correction-style keywords. Bilingual conservative set (English + Spanish): English entries are short unambiguous verbs (undo, revert, rollback, redo, incorrect, wrong, broken, …); Spanish entries are anchored phrases where ambiguous (está mal, está roto, no funciona, deshaz, rehaz, no es lo que, vuelve atrás, …). Substring match — a known limitation is that negations like 'no está mal' will match 'está mal'. Heuristic only; meant for retro pre-fill, not as a strict correction rate."
     },
     "end_reason": {
       "type": "string",

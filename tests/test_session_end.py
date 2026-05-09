@@ -624,6 +624,72 @@ class TestSessionEndHook(unittest.TestCase):
         self.assertEqual(row["subagent_invocations"], {})
         self.assertEqual(row["correction_keyword_hits"], 0)
 
+    def test_correction_keywords_match_spanish_phrases(self):
+        """Bilingual detector: Spanish corrections must count just like
+        English ones, with anchored phrases avoiding false positives on
+        common short tokens (`mal`, `roto`).
+
+        Documented limitation: substring match has no negation awareness,
+        so `no está mal` ("not bad", actually positive) WILL match the
+        anchored `está mal` keyword. This is accepted — fixing it requires
+        word-boundary regex on the hook's hot path. The matcher is a
+        retro pre-fill heuristic, not a strict correction rate. /retrospective
+        remains the source of truth for correction_rate."""
+        transcript = self.home / "t.jsonl"
+        entries = [
+            # First user message — long enough not to count as a short
+            # follow-up, just establishes the user_msg_count baseline.
+            {"type": "user", "timestamp": "2026-04-14T10:00:00Z",
+             "message": {"role": "user", "content": [
+                 {"type": "text", "text": "Implementa el endpoint de login con JWT y un test que cubra el happy path completo."},
+             ]}},
+            make_assistant("claude-sonnet-4-5", "2026-04-14T10:00:10Z",
+                           input_t=100, output_t=50, tools=["Read"]),
+            # ES corrections — true positives (one match each):
+            {"type": "user", "timestamp": "2026-04-14T10:00:20Z",
+             "message": {"role": "user", "content": [
+                 {"type": "text", "text": "deshaz eso"},
+             ]}},
+            {"type": "user", "timestamp": "2026-04-14T10:00:25Z",
+             "message": {"role": "user", "content": [
+                 {"type": "text", "text": "no es lo que pedí, rehaz"},
+             ]}},
+            {"type": "user", "timestamp": "2026-04-14T10:00:30Z",
+             "message": {"role": "user", "content": [
+                 {"type": "text", "text": "está roto, revierte el cambio"},
+             ]}},
+            # Documented FP: `no está mal` should be positive ("not bad"),
+            # but our substring matcher catches `está mal` inside it. The
+            # test pins the current behavior so a future word-boundary
+            # refactor will surface here.
+            {"type": "user", "timestamp": "2026-04-14T10:00:35Z",
+             "message": {"role": "user", "content": [
+                 {"type": "text", "text": "no está mal el approach"},
+             ]}},
+            # True negative: technical text mentioning excluded bare tokens
+            # (`mal` inside `formal`, `error` excluded entirely).
+            {"type": "user", "timestamp": "2026-04-14T10:00:40Z",
+             "message": {"role": "user", "content": [
+                 {"type": "text", "text": "El parser formal acepta este token sin error"},
+             ]}},
+        ]
+        write_transcript(transcript, entries)
+
+        run_hook({
+            "hook_event_name": "SessionEnd",
+            "session_id": "s-es",
+            "transcript_path": str(transcript),
+            "cwd": "/x",
+        }, self.home)
+        rows = read_jsonl(self.auto_path)
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+
+        # 4 ES TPs (deshaz, no es lo que + rehaz, está roto + revierte,
+        # no está mal — known FP). The negative-control message about
+        # `formal` and `error` must NOT match.
+        self.assertEqual(row["correction_keyword_hits"], 4)
+
     def test_v3_signals_present_on_error_row(self):
         """Error rows (empty_transcript / parse_crash) must include v3 fields
         as zero/empty so the schema stays valid."""
