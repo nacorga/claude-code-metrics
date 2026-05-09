@@ -96,14 +96,24 @@ class _Fixture:
         if pricing is not None:
             (self.metrics_dir / "pricing.json").write_text(json.dumps(pricing))
 
-    def run(self, *args: str) -> tuple[int, str, Path]:
-        """Run main() in-process (stdout/stderr captured), return (rc, html_text, output_path)."""
+    def run(self, *args: str,
+            freeze_now: datetime | None = NOW) -> tuple[int, str, Path]:
+        """Run main() in-process (stdout/stderr captured).
+
+        `freeze_now` defaults to the module-level `NOW` so every time-windowed
+        test sees a hermetic clock — fixtures are built from `_ts(N)` against
+        the same NOW, and production reads it through the test seam in
+        `_render.main(now=...)`. Pass `freeze_now=None` to opt out: tests
+        that compose their own timestamped inputs from real-clock now (e.g.
+        `TestHealthSignal` building log lines) need real-vs-real comparison
+        and must NOT freeze production's clock.
+        """
         out = self.metrics_dir / "report.html"
         argv = ["--metrics-dir", str(self.metrics_dir),
                 "--output", str(out)] + list(args)
         with contextlib.redirect_stdout(io.StringIO()), \
              contextlib.redirect_stderr(io.StringIO()):
-            rc = _render.main(argv)
+            rc = _render.main(argv, now=freeze_now)
         text = out.read_text() if out.is_file() else ""
         return rc, text, out
 
@@ -204,6 +214,20 @@ class TestNoData(unittest.TestCase):
             self.assertTrue(path.is_file())
             self.assertIn("No sessions match", html)
             self.assertIn("--since all", html)
+        finally:
+            fx.cleanup()
+
+    def test_empty_window_still_renders_recommendations_anchor(self):
+        # Regression: with no rows in window, the static TOC links to
+        # `#recommendations` so the section must still exist (with an
+        # empty state) — otherwise the TOC dangles.
+        rows = [_make_row(ts=_ts(40))]
+        fx = _Fixture(rows)
+        try:
+            rc, html, _ = fx.run()  # default 30d → empty window
+            self.assertEqual(rc, 0)
+            self.assertIn('id="recommendations"', html)
+            self.assertIn("No actionable recommendations", html)
         finally:
             fx.cleanup()
 
@@ -521,7 +545,10 @@ class TestHealthSignal(unittest.TestCase):
                 f"[{recent}] [ERROR] hook crashed parsing payload",
                 f"[{recent}] [ERROR] another failure",
             ])
-            rc, html, _ = fx.run("--since", "all")
+            # Log timestamps were composed from real-clock now → production
+            # health-signal must compare against real now too. Opt out of
+            # the fixture's hermetic clock.
+            rc, html, _ = fx.run("--since", "all", freeze_now=None)
             self.assertEqual(rc, 0)
             self.assertIn("hook errors (7d): 2", html)
             self.assertIn('<p class="health-warning">', html)
@@ -544,7 +571,8 @@ class TestHealthSignal(unittest.TestCase):
                 f"[{recent}] [INFO] skip: ghost session",
                 f"[{recent}] [INFO] dedupe: session_id abc already recorded",
             ])
-            rc, html, _ = fx.run("--since", "all")
+            # Log timestamps composed from real-clock now → opt out.
+            rc, html, _ = fx.run("--since", "all", freeze_now=None)
             self.assertEqual(rc, 0)
             self.assertIn("hook errors (7d): 0", html)
             self.assertNotIn('<p class="health-warning">', html)
@@ -558,7 +586,8 @@ class TestHealthSignal(unittest.TestCase):
             now = datetime.now(timezone.utc)
             old = (now - timedelta(days=30)).isoformat()
             self._write_log(fx, [f"[{old}] [ERROR] long-ago crash"])
-            rc, html, _ = fx.run("--since", "all")
+            # Log timestamps composed from real-clock now → opt out.
+            rc, html, _ = fx.run("--since", "all", freeze_now=None)
             self.assertEqual(rc, 0)
             self.assertIn("hook errors (7d): 0", html)
             self.assertNotIn('<p class="health-warning">', html)
@@ -579,7 +608,8 @@ class TestHealthSignal(unittest.TestCase):
             (fx.metrics_dir / "hook.log.1").write_text(
                 f"[{recent}] [ERROR] failure pre-rotation\n"
             )
-            rc, html, _ = fx.run("--since", "all")
+            # Log timestamps composed from real-clock now → opt out.
+            rc, html, _ = fx.run("--since", "all", freeze_now=None)
             self.assertEqual(rc, 0)
             self.assertIn("hook errors (7d): 1", html)
             self.assertIn('<p class="health-warning">', html)

@@ -45,16 +45,25 @@ CHEAP_RETURN_THRESHOLD = 200
 # observation: real prompts are usually longer; quick redirects are shorter.
 SHORT_FOLLOWUP_MAX_CHARS = 200
 
-# Correction keywords. Conservative English-only set: each phrase is a strong
-# signal that the user is undoing, redoing, or rejecting the assistant's last
-# action. Matched as case-insensitive substrings on the first 200 chars of
-# each user message — short corrections live at the top. Order does not
-# matter; we count distinct messages that hit at least once.
+# Correction keywords. Bilingual conservative set (English + Spanish): each
+# phrase is a strong signal that the user is undoing, redoing, or rejecting
+# the assistant's last action. Matched as case-insensitive substrings on the
+# first 200 chars of each user message — short corrections live at the top.
+# Order does not matter; we count distinct messages that hit at least once.
 #
-# Kept intentionally short and English-only to stay project-agnostic. Locale-
-# specific sets can be added downstream by analyzers; the hook only ships a
-# safe default.
+# Inclusion bar (do not lower without evidence):
+#   - long enough or distinctive enough to avoid false positives in normal
+#     prose. English `undo`/`revert` are unambiguous; Spanish `mal`/`roto`
+#     are not — those must be anchored as phrases (`está mal`, `está roto`).
+#   - Excluded as too FP-prone: bare `mal`, bare `roto`, `error`, `falla`,
+#     `arregla`. They appear in casual text and identifier names.
+#   - Substring match has a known limitation: `está mal` inside `no está
+#     mal` ("not bad") will match. Accepted — fixing it requires word-
+#     boundary regex which adds cost on the hot path. The matcher is a
+#     heuristic; /retrospective remains the source of truth for correction
+#     rate.
 CORRECTION_KEYWORDS = (
+    # English
     "undo",
     "revert",
     "rollback",
@@ -66,6 +75,21 @@ CORRECTION_KEYWORDS = (
     "doesnt work",
     "not what i asked",
     "not what i wanted",
+    # Spanish (anchored phrases where ambiguous)
+    "deshaz",
+    "revierte",
+    "rehaz",
+    "incorrecto",
+    "incorrecta",
+    "no es eso",
+    "no es lo que",
+    "vuelve atrás",
+    "vuelve atras",
+    "está mal",
+    "esta mal",
+    "está roto",
+    "esta roto",
+    "no funciona",
 )
 
 # Transcript timestamps sometimes span days when a session is resumed after

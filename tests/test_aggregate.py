@@ -89,6 +89,7 @@ EXPECTED_KEYS = {
     "cheap_total", "cheap_dispatches", "cheap_rows", "cheap_offenders",
     "tool_errors", "total_errors", "v3_err_count",
     "correction_heavy",
+    "tool_dominance_sessions",
     "by_week",
     "schema_versions",
 }
@@ -445,6 +446,46 @@ class TestToolTotals(unittest.TestCase):
         ]
         agg = aggregate(rows, {}, {})
         self.assertEqual(agg["tool_totals"], {"Read": 8, "Edit": 2, "Bash": 1})
+
+
+# ---------------------------------------------------------------------------
+# Tool dominance — sessions where a single tool ran >=70% of >=30 calls.
+# ---------------------------------------------------------------------------
+
+class TestToolDominance(unittest.TestCase):
+    def test_dominant_session_captured(self):
+        rows = [_row(session_id="b1", tool_calls_total=35,
+                     tool_distribution={"Bash": 28, "Read": 7})]
+        agg = aggregate(rows, {}, {})
+        td = agg["tool_dominance_sessions"]
+        self.assertEqual(len(td), 1)
+        self.assertEqual(td[0]["tool"], "Bash")
+        self.assertEqual(td[0]["count"], 28)
+        self.assertEqual(td[0]["total"], 35)
+        self.assertAlmostEqual(td[0]["fraction"], 28 / 35)
+
+    def test_below_30_calls_excluded(self):
+        rows = [_row(session_id="x", tool_calls_total=20,
+                     tool_distribution={"Bash": 18, "Read": 2})]
+        agg = aggregate(rows, {}, {})
+        self.assertEqual(agg["tool_dominance_sessions"], [])
+
+    def test_below_70_percent_excluded(self):
+        rows = [_row(session_id="x", tool_calls_total=40,
+                     tool_distribution={"Bash": 24, "Read": 16})]
+        agg = aggregate(rows, {}, {})
+        self.assertEqual(agg["tool_dominance_sessions"], [])
+
+    def test_sorted_by_fraction_desc(self):
+        rows = [
+            _row(session_id="hi",
+                 tool_distribution={"Bash": 90, "Read": 10}),
+            _row(session_id="lo",
+                 tool_distribution={"Bash": 70, "Read": 30}),
+        ]
+        agg = aggregate(rows, {}, {})
+        td = agg["tool_dominance_sessions"]
+        self.assertEqual([d["session_id"] for d in td], ["hi", "lo"])
 
 
 if __name__ == "__main__":

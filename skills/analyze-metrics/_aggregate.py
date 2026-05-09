@@ -220,6 +220,34 @@ def aggregate(auto: list[dict], retro_by_id: dict[str, dict],
         reverse=True,
     )
 
+    # Tool dominance — sessions where one tool ran ≥70% of total calls with
+    # at least 30 calls total. Heavy single-tool workflows are candidates
+    # for a script or skill; surfaced for /recommend's pattern.tool_dominance
+    # rule. Uncapped (per-session list, naturally bounded by the window).
+    tool_dominance_sessions: list[dict] = []
+    for a in auto:
+        td = a.get("tool_distribution") or {}
+        if not td:
+            continue
+        total_td = sum(td.values())
+        if total_td < 30:
+            continue
+        top_tool, top_count = max(td.items(), key=lambda kv: kv[1])
+        frac = top_count / total_td
+        if frac < 0.70:
+            continue
+        tool_dominance_sessions.append({
+            "session_id": a.get("session_id"),
+            "tool": top_tool,
+            "count": top_count,
+            "total": total_td,
+            "fraction": frac,
+            "cost_usd": a.get("cost_usd"),
+        })
+    tool_dominance_sessions.sort(
+        key=lambda x: (x["fraction"], x["count"]), reverse=True,
+    )
+
     # Cost trend by ISO week
     by_week: dict[str, list[float]] = defaultdict(lambda: [0.0, 0])
     for a in auto:
@@ -269,6 +297,7 @@ def aggregate(auto: list[dict], retro_by_id: dict[str, dict],
         "total_errors": total_errors,
         "v3_err_count": v3_err_count,
         "correction_heavy": v3_corr[:10],
+        "tool_dominance_sessions": tool_dominance_sessions,
         "by_week": dict(by_week),
         "schema_versions": schema_versions,
     }

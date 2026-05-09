@@ -10,7 +10,7 @@ Guidance for Claude Code (and contributors) working in this repo. See [README.md
 - **Never block Claude Code.** The hook must always `exit 0`, even on crashes. Any failure logs to `~/.claude/metrics/hook.log` (rotated to `hook.log.1` at 1MB; one generation kept) and moves on. Log lines have the shape `[<iso8601>] [<LEVEL>] <message>`: use `log()` for informational events (`[INFO]`) and `log_error()` for real degradation (`[ERROR]`). The "recent hook errors" warning in `/analyze-metrics` and `/metrics-report` counts only `[ERROR]` lines (across `hook.log` and the rotated `hook.log.1`), so informational notices like `_default` pricing fallbacks never fire false positives.
 - **Return to the shell in <100ms.** Heavy work (transcript parsing) runs in a double-forked, detached grandchild. Large sessions (60MB+ transcripts) cannot stall session close. Set `CCM_NO_FORK=1` for synchronous execution (tests).
 - **Append-only.** We never rewrite `auto.jsonl` / `retro.jsonl`. Migrations happen by bumping `schema_version` and letting old + new rows coexist.
-- **Repo SKILL.md is ground truth, not the installed copy.** `~/.claude/skills/{retrospective,analyze-metrics,metrics-report}/SKILL.md` are install artefacts. Edits made directly there are lost on the next `scripts/install.sh`. Always edit the repo source and re-install.
+- **Repo SKILL.md is ground truth, not the installed copy.** `~/.claude/skills/{retrospective,analyze-metrics,metrics-report,recommend}/SKILL.md` are install artefacts. Edits made directly there are lost on the next `scripts/install.sh`. Always edit the repo source and re-install.
 
 ## Critical files
 
@@ -23,7 +23,9 @@ Guidance for Claude Code (and contributors) working in this repo. See [README.md
 | `skills/analyze-metrics/_helpers.py`  | Shared filter / project-identity / health-signal helpers (also used by `/metrics-report`) |
 | `skills/analyze-metrics/_aggregate.py`| Shared aggregation logic — single source of truth for every cut both reports show. Imported by `/analyze-metrics` and `/metrics-report` to keep the markdown and HTML formats in lockstep. |
 | `skills/metrics-report/SKILL.md`      | Manual `/metrics-report` — invokes `_render.py`                 |
-| `skills/metrics-report/_render.py`    | Static HTML report generator. Stdlib-only, no JS, no CDN        |
+| `skills/metrics-report/_render.py`    | Static HTML report generator. Stdlib-only, no JS, no CDN. Embeds `/recommend`'s output as a section. |
+| `skills/recommend/SKILL.md`           | Manual `/recommend` — prescriptive recommendations from the captured signals |
+| `skills/recommend/_recommend.py`      | Rule engine. Each rule is a pure function returning `Recommendation \| None`; thresholds calibrated against real session distributions, suppressed below `--min-evidence`. |
 | `scripts/install.sh` / `uninstall.sh` | Idempotent; patch `~/.claude/settings.json` via Python (json)   |
 | `schema/{auto,retro}.schema.json`     | JSON Schema docs. Source of truth for row shape                 |
 | `tests/`                              | Stdlib `unittest`. Zero external deps. Must stay green          |
